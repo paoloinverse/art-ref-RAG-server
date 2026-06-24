@@ -109,8 +109,8 @@ This system was conceived to run for long sessions on modest hardware (including
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/paoloinverse/art-ref-RAG-server.git
+cd art-ref-RAG-server
 ```
 
 ### 2. Create and activate a virtual environment
