@@ -1,5 +1,5 @@
 # Art-ref-RAG-server
-CLIP-ViT-L-14 + LanceDB based RAG server for large-scale storage of artistic references, offering FTS, booru tag, natural language and image/sketch vector search.
+CLIP-ViT-L-14 + LanceDB based RAG server for large-scale storage of artistic references, offering FTS, booru tag, natural language and image/sketch vector search. Query with the Art-ref-RAG-frontend
 
 
 # Multimodal RAG Agent for Artists — Drawing Reference Server
@@ -57,7 +57,7 @@ Results can be returned together with the actual image content pulled from local
 
 ## Hardware & Thermal Optimization Philosophy
 
-This system was conceived to run for long sessions on modest hardware (including laptops and mini-PCs) without overheating the GPU, hammering the SSD, or ballooning RAM. The ingestion pipeline is built around the following principles:
+This system was conceived to run for long sessions on modest hardware (including laptops) without overheating the GPU, hammering the SSD, or ballooning RAM. Of course it will shine on gaming PCs or more powerful hardware and is able to ingest / search through millions of images in a single table. The ingestion pipeline is built around the following principles:
 
 1. **Decoupled embedding and writing.** Embeddings are produced in configurable batches and accumulated into an in-memory row buffer. LanceDB writes are performed only when the buffer reaches the configured `Record Buffer Limit`, replacing the much heavier `merge_insert` path with simple `add()` appends. This avoids the O(N²) write amplification that occurs when every record triggers a merge operation.
 
