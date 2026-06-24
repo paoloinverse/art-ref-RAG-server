@@ -101,6 +101,7 @@ This system was conceived to run for long sessions on modest hardware (including
 - `huggingface_hub`
 - `pymupdf` — PDF extraction (only required for PDF ingestion)
 - `psutil` — memory diagnostics
+- `gc` — garbage collector
 
 ---
 
@@ -140,7 +141,7 @@ python -m pip install --upgrade pip
 pip install PySide6 pyzmq lancedb pyarrow numpy pillow
 pip install torch torchvision
 pip install sentence-transformers transformers huggingface_hub
-pip install pymupdf psutil
+pip install pymupdf psutil gc
 ```
 
 > **Tip — CUDA-enabled PyTorch:**  
