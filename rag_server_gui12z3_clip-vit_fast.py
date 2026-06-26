@@ -220,7 +220,7 @@ class RagAgentWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Multimodal RAG Agent (General Purpose)")
+        self.setWindowTitle("Multimodal RAG Server")
         self.resize(1100, 800)
 
         # Agent State
@@ -236,7 +236,8 @@ class RagAgentWindow(QMainWindow):
         
         # Model State
         self.active_model_obj = "dummy"
-
+        self.is_ingesting = False
+        self.stop_requested = False
         self.model_loader_thread = None
         
         # Simplified Model Registry
@@ -328,6 +329,10 @@ class RagAgentWindow(QMainWindow):
         self.save_cfg_btn = QPushButton("Save Config")
         self.load_cfg_btn = QPushButton("Load Config")
         self.start_srv_btn = QPushButton("Start TCP Server")
+        self.stop_ingest_btn = QPushButton("Stop Ingestion")
+        self.stop_ingest_btn.setStyleSheet("background-color: #a33; color: white; font-weight: bold;")
+        self.stop_ingest_btn.clicked.connect(self.stop_ongoing_ingestion)
+        self.stop_ingest_btn.setEnabled(False)
         
         self.save_cfg_btn.clicked.connect(self.save_config)
         self.load_cfg_btn.clicked.connect(self.load_config)
@@ -339,6 +344,7 @@ class RagAgentWindow(QMainWindow):
         btn_layout.addWidget(self.save_cfg_btn)
         btn_layout.addWidget(self.load_cfg_btn)
         btn_layout.addWidget(self.start_srv_btn)
+        btn_layout.addWidget(self.stop_ingest_btn)
         btn_layout.addWidget(self.chk_return_img_b64)
         btn_layout.addStretch()
 
@@ -475,6 +481,9 @@ class RagAgentWindow(QMainWindow):
         self.video_fps.setSingleStep(0.5)
         self.video_fps.setValue(1.0)
 
+        self.chk_smart_video_skip = QCheckBox("Smart Video Sampling Skip (Check last 4 frames)")
+        self.chk_smart_video_skip.setChecked(False)
+
         self.video_progress = QProgressBar()
         self.video_progress.setValue(0)
 
@@ -484,7 +493,8 @@ class RagAgentWindow(QMainWindow):
 
         video_layout.addRow("Source Folder:", vdir_layout)
         video_layout.addRow("Extraction FPS:", self.video_fps)
-        video_layout.addRow("", self.video_progress)
+        video_layout.addRow(" ", self.chk_smart_video_skip)
+        video_layout.addRow(" ", self.video_progress)
         video_layout.addRow("", self.video_ingest_btn)
 
         self.ingest_tabs.addTab(tab_video, "Video Pipeline")
@@ -1451,15 +1461,52 @@ class RagAgentWindow(QMainWindow):
     # BATCH & LIVE MONITORING LOGIC
     # =====================================================================
 
+    def stop_ongoing_ingestion(self):
+        self.stop_requested = True
+        self.log_diag("[SYSTEM] Stop requested. Finishing current atomic operations...")
+        self.stop_ingest_btn.setEnabled(False)
+
+    def _probe_video(self, video_path: str):
+        cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_streams", "-select_streams", "v:0", video_path
+        ]
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            data = json.loads(result.stdout)
+            if 'streams' in data and len(data['streams']) > 0:
+                stream = data['streams'][0]
+                fps_str = stream.get('r_frame_rate', '0/1')
+                num, den = map(int, fps_str.split('/'))
+                native_fps = num / den if den != 0 else 30.0
+                
+                duration = float(stream.get('duration', 0))
+                if duration == 0:
+                    cmd_fmt = [
+                        "ffprobe", "-v", "quiet", "-print_format", "json",
+                        "-show_format", video_path
+                    ]
+                    res_fmt = subprocess.run(cmd_fmt, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+                    fmt_data = json.loads(res_fmt.stdout)
+                    duration = float(fmt_data.get('format', {}).get('duration', 0))
+                
+                return native_fps, duration
+        except Exception as e:
+            self.log_diag(f"[PROBE ERROR] {e}")
+        return 30.0, 0.0
+
+
     def set_gui_enabled(self, enabled: bool):
         """
         Locks or unlocks interactive elements to prevent database corruption from 
         out-of-band requests while synchronous ingestion yields to the main event loop.
         """
+        self.is_ingesting = not enabled
         self.ingest_tabs.setEnabled(enabled)
         self.load_model_btn.setEnabled(enabled)
         self.start_srv_btn.setEnabled(enabled)
         self.query_btn.setEnabled(enabled)
+        self.stop_ingest_btn.setEnabled(self.is_ingesting)
         
         # Lock new table controls
         self.create_table_btn.setEnabled(enabled)
@@ -1495,12 +1542,18 @@ class RagAgentWindow(QMainWindow):
             
         found_files = []
         for root, dirs, files in os.walk(directory):
+            if self.stop_requested: break
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
                 if ext in exts:
                     found_files.append(os.path.join(root, file))
             if not self.chk_recurse.isChecked():
                 break
+    
+        if self.stop_requested:
+            self.log_diag("[SYSTEM] Ingestion stopped by user.")
+            self.set_gui_enabled(True)
+            return
 
         if found_files:
             self.process_file_batch(found_files)
@@ -1565,6 +1618,7 @@ class RagAgentWindow(QMainWindow):
 
         chunk_size = self.text_batch_size.value()
         for i in range(0, len(batch_texts), chunk_size):
+            if self.stop_requested: break
             chunk_texts = batch_texts[i:i+chunk_size]
             chunk_metas = batch_metas[i:i+chunk_size]
             self._embed_and_buffer_texts(chunk_texts, chunk_metas)
@@ -1594,6 +1648,7 @@ class RagAgentWindow(QMainWindow):
         other_files = []
 
         for path in file_paths:
+            if self.stop_requested: break
             if path in self.processed_files:
                 continue
                 
@@ -1665,6 +1720,7 @@ class RagAgentWindow(QMainWindow):
                     headers = next(reader, None)
                     
                 for i, row in enumerate(reader):
+                    if self.stop_requested: break
                     if not row: continue
                     text = " | ".join(row).strip()
                     if not text: continue
@@ -1937,6 +1993,7 @@ class RagAgentWindow(QMainWindow):
             buffer_limit = self.pdf_batch_size.value()
             
             for i in range(len(doc)):
+                if self.stop_requested: break
                 page = doc[i]
                 text = page.get_text().strip()
                 
@@ -2301,171 +2358,276 @@ class RagAgentWindow(QMainWindow):
             self.video_progress.setMaximum(total_videos)
             
             for v_idx, video_path in enumerate(video_files):
+                if self.stop_requested:
+                    self.log_diag("[SYSTEM] Stop requested. Aborting video ingestion.")
+                    break
+                    
                 current_video_idx = v_idx + 1
                 self.log_diag(f"[VIDEO] Processing video {current_video_idx}/{total_videos}: {os.path.basename(video_path)}")
                 
                 video_dir = os.path.join(temp_base, f"vid_{v_idx}")
                 os.makedirs(video_dir, exist_ok=True)
                 
-                # Extract frames for this single video
-                cmd = [
-                    "ffmpeg", "-threads", "4", "-filter_threads", "4", "-nostdin", "-i", video_path,
-                    "-vf", f"fps={fps}", "-q:v", "2",
-                    f"{video_dir}/frame_%08d.jpg", "-y"
-                ]
-                # --- FIX: discard FFmpeg's voluminous stderr instead of buffering it in RAM ---
-                devnull = open(os.devnull, "w")
-                try:
-                    subprocess.run(cmd, stdout=devnull, stderr=devnull, check=False)
-                finally:
-                    devnull.close()
-                
-                frames = sorted([f for f in os.listdir(video_dir) if f.endswith('.jpg')])
-                num_frames = len(frames)
-                self.log_diag(f"[VIDEO] Extracted {num_frames} frames from {os.path.basename(video_path)}. Starting embedding & upsert...")
-                
-                if num_frames == 0:
-                    # No frames extracted, clean up and continue
-                    if os.path.exists(video_dir):
-                        os.rmdir(video_dir)
-                    self.video_progress.setValue(current_video_idx)
-                    QApplication.processEvents()
-                    continue
-                
-                # Process frames for this video in chunks (for embedding efficiency)
-                chunk_size = self.video_batch_size.value()
-                for i in range(0, num_frames, chunk_size):
-                    chunk_frames = frames[i : i + chunk_size]
-                    
-                    chunk_paths = []
-                    chunk_keys = []
-                    chunk_frame_files = []
-                    
-                    for f_file in chunk_frames:
-                        frame_path = os.path.join(video_dir, f_file)
-                        content_key = f"{video_path}_{fps}_{f_file}"
-                        chunk_paths.append(frame_path)
-                        chunk_keys.append(content_key)
-                        chunk_frame_files.append(f_file)
-
-                    # Check DB for existing vectors in this chunk
-                    safe_keys = [k.replace("'", "''") for k in chunk_keys]
-                    placeholders = ", ".join([f"'{k}'" for k in safe_keys])
-
-                    # --- FIX: use Arrow directly, skip the pandas round-trip ---
-                    existing_matches = (
-                        self.table.search()
-                        .where(f"content_key IN ({placeholders})")
-                        .select(["content_key", "video_vector"])
-                        .to_arrow()
-                    )
-
-                    key_to_vec = {}
-                    if existing_matches is not None and len(existing_matches) > 0:
-                        keys_col = existing_matches["content_key"].to_pylist()
-                        vecs_col = existing_matches["video_vector"].to_pylist()
-                        key_to_vec = dict(zip(keys_col, vecs_col))
-                    del existing_matches
-
-                    # Identify frames needing fresh embedding
-                    paths_to_embed = []
-                    for idx, key in enumerate(chunk_keys):
-                        if key not in key_to_vec:
-                            paths_to_embed.append(chunk_paths[idx])
-
-                    # Batch Embedding
-                    computed_vecs = {}
-                    if paths_to_embed:
-                        if m_type ==  "dummy " or self.active_model_obj ==  "dummy ":
-                            for p in paths_to_embed:
-                                v = np.random.rand(dim).astype(np.float32)
-                                computed_vecs[p] = (v / np.linalg.norm(v)).tolist()
-                        else:
-                            import torch
-                            from PIL import Image
-                            with torch.no_grad():
-                                self.active_model_obj.eval()
-
-                                # --- FIX: Explicitly load images, encode them, THEN close ---
-                                images = []
-                                try:
-                                    for p in paths_to_embed:
-                                        img = Image.open(p)
-                                        img.load()                       # force pixel decode while FD is open
-                                        images.append(img.convert("RGB"))
-                                
-                                    # Encode while images are still open
-                                    features = self.active_model_obj.encode(images)
-
-                                finally:
-                                    # Close images AFTER encoding is complete
-                                    for img in images:
-                                        try: img.close()
-                                        except Exception: pass
-
-                                # Drop image references so their buffers can be freed
-                                del images
-
-                                if hasattr(features, "detach"):
-                                    features = features.detach().cpu().numpy()
-                                features = np.array(features, dtype=np.float32)
-                                norms = np.linalg.norm(features, axis=1, keepdims=True)
-                                norms[norms == 0] = 1
-                                features = features / norms
-                                for idx, p in enumerate(paths_to_embed):
-                                    computed_vecs[p] = features[idx].tolist()
-
-                                # Release CUDA/CPU allocator caches periodically
-                                del features
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-
-                    # Construct rows for upsert -> ONLY BUFFER NEW RECORDS
-                    for idx, (key, path, f_file) in enumerate(zip(chunk_keys, chunk_paths, chunk_frame_files)):
-                        if key in key_to_vec:
-                            continue # Already in DB, skip to avoid merge_insert overhead and maintain deduplication
+                # --- SMART VIDEO SAMPLING SKIP ---
+                if self.chk_smart_video_skip.isChecked():
+                    native_fps, duration = self._probe_video(video_path)
+                    if duration > 0:
+                        sampling_fps = fps
+                        timestamps = []
+                        for i in range(4):
+                            t = duration - (i / sampling_fps)
+                            if t < 0: t = 0.0
+                            timestamps.append(t)
+                        timestamps = sorted(list(set(timestamps)))
+                        
+                        probe_keys = []
+                        probe_files = []
+                        for t in timestamps:
+                            frame_idx = max(1, int(round(t * sampling_fps)))
+                            frame_file = f"frame_{frame_idx:08d}.jpg"
+                            content_key = f"{video_path}_{fps}_{frame_file}"
+                            probe_keys.append(content_key)
                             
-                        v_vec = computed_vecs[path]
-                        meta = json.dumps({"source": os.path.basename(video_path), "frame_file": f_file, "type": "video_frame", "source_video": video_path, "fps": fps})
-                        row_buffer.append({
-                             "id": str(uuid.uuid4()),
-                             "text_vector": [0.0] * dim,
-                             "image_vector": [0.0] * dim,
-                             "video_vector": v_vec,
-                             "text": "",
-                             "image_path": "",
-                             "metadata": meta,
-                             "text_hash": "",
-                             "image_hash": "",
-                             "metadata_hash": self._calc_hash(meta),
-                             "empty_text": True,
-                             "empty_image": True,
-                             "empty_video": False,
-                             "type": "video_frame",
-                             "fps": fps,
-                             "content_key": key
-                        })
-    
-                    # Cleanup temp frames for this chunk immediately
-                    for path in chunk_paths:
-                         if os.path.exists(path):
-                            os.remove(path)
-    
-                    ### diagnostics on terminal
-                    print(f"video row_buffer status: {len(row_buffer)} / {buffer_limit} ")
+                            temp_frame_path = os.path.join(video_dir, f"probe_{frame_idx:08d}.jpg")
+                            probe_files.append(temp_frame_path)
+                        
+                            cmd_probe = [
+                                "ffmpeg", "-threads", "4", "-filter_threads", "4", "-nostdin", "-ss", str(t), "-i", video_path,
+                                "-frames:v", "1", "-q:v", "2", temp_frame_path, "-y"
+                            ]
+                            subprocess.run(cmd_probe, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            
+                        safe_keys = [k.replace("'", "''") for k in probe_keys]
+                        placeholders = ", ".join([f"'{k}'" for k in safe_keys])
+                        
+                        existing_matches = (
+                            self.table.search()
+                            .where(f"content_key IN ({placeholders})")
+                            .select(["content_key"])
+                            .to_arrow()
+                        )
+                    
+                        existing_keys = set(existing_matches["content_key"].to_pylist()) if existing_matches is not None and len(existing_matches) > 0 else set()
+                    
+                        for pf in probe_files:
+                            if os.path.exists(pf):
+                                os.remove(pf)
+                            
+                        if len(existing_keys) == len(probe_keys):
+                            self.log_diag(f"[VIDEO] Smart Skip: All {len(probe_keys)} probe frames found in DB. Skipping {os.path.basename(video_path)}.")
+                            self.video_progress.setValue(current_video_idx)
+                            # Clean up the empty video directory before continuing
+                            if os.path.exists(video_dir):
+                                try:
+                                    os.rmdir(video_dir)
+                                except Exception:
+                                    pass
+                            QApplication.processEvents()
+                            continue
+                        else:
+                            self.log_diag(f"[VIDEO] Smart Skip: Probe incomplete. Full extraction for {os.path.basename(video_path)}.")
+                # -----------------------------------
+
+                            # Extract frames for this single video in batches to prevent disk saturation
+                            batch_frame_limit = 4096
+                            batch_duration = batch_frame_limit / fps
+                            current_time = 0.0
+                            total_extracted_frames = 0
+            
+                            while True:
+                                if self.stop_requested:
+                                    break
+                    
+                                # Clean directory before each batch extraction
+                                for f in os.listdir(video_dir):
+                                    try:
+                                        os.remove(os.path.join(video_dir, f))
+                                    except Exception:
+                                        pass
+                                        
+                                start_frame_number = int(round(current_time * fps)) + 1
+                                
+                                cmd = [
+                                    "ffmpeg", "-threads", "4", "-filter_threads", "4", "-nostdin",
+                                    "-ss", str(current_time),
+                                    "-i", video_path,
+                                    "-vf", f"fps={fps}", "-q:v", "2",
+                                    "-frames:v", str(batch_frame_limit),
+                                    "-start_number", str(start_frame_number),
+                                    f"{video_dir}/frame_%08d.jpg", "-y"
+                                ]
                 
-                    # Trigger atomic append ONLY when threshold is reached
-                    if len(row_buffer) >= buffer_limit:
-                        self.table.add(row_buffer) # Use add() instead of merge_insert() for massive memory savings
-                        row_buffer.clear()
-                        gc.collect() # Force GC to reclaim memory from cleared buffer
-                        QApplication.processEvents()
+                                devnull = open(os.devnull, "w")
+                                try:
+                                    subprocess.run(cmd, stdout=devnull, stderr=devnull, check=False)
+                                finally:
+                                    devnull.close()
+                
+                                frames = sorted([f for f in os.listdir(video_dir) if f.endswith('.jpg')])
+                                num_frames = len(frames)
+                                
+                                if num_frames == 0:
+                                    break
+                    
+                                total_extracted_frames += num_frames
+                                self.log_diag(f"[VIDEO] Extracted batch of {num_frames} frames (starting at {start_frame_number}) from {os.path.basename(video_path)}.")
+                
+                                # Process frames for this batch in chunks (for embedding efficiency)
+                                chunk_size = self.video_batch_size.value()
+                                for i in range(0, num_frames, chunk_size):
+                                    if self.stop_requested:
+                                        break
+                                    chunk_frames = frames[i : i + chunk_size]
+                    
+                                    chunk_paths = []
+                                    chunk_keys = []
+                                    chunk_frame_files = []
+                                    
+                                    for f_file in chunk_frames:
+                                        frame_path = os.path.join(video_dir, f_file)
+                                        content_key = f"{video_path}_{fps}_{f_file}"
+                                        chunk_paths.append(frame_path)
+                                        chunk_keys.append(content_key)
+                                        chunk_frame_files.append(f_file)
+                
+                                    # Check DB for existing vectors in this chunk
+                                    safe_keys = [k.replace("'", "''") for k in chunk_keys]
+                                    placeholders = ", ".join([f"'{k}'" for k in safe_keys])
+                
+                                    # --- FIX: use Arrow directly, skip the pandas round-trip ---
+                                    existing_matches = (
+                                        self.table.search()
+                                        .where(f"content_key IN ({placeholders})")
+                                        .select(["content_key", "video_vector"])
+                                        .to_arrow()
+                                    )
 
-                    QApplication.processEvents()
+                                    key_to_vec = {}
+                                    if existing_matches is not None and len(existing_matches) > 0:
+                                        keys_col = existing_matches["content_key"].to_pylist()
+                                        vecs_col = existing_matches["video_vector"].to_pylist()
+                                        key_to_vec = dict(zip(keys_col, vecs_col))
+                                    del existing_matches
 
-                # Cleanup temp directory for this video after all frames processed
-                if os.path.exists(video_dir):
-                    os.rmdir(video_dir)
+                                    # Identify frames needing fresh embedding
+                                    paths_to_embed = []
+                                    for idx, key in enumerate(chunk_keys):
+                                        if key not in key_to_vec:
+                                            paths_to_embed.append(chunk_paths[idx])
+                                                
+                                    # Batch Embedding
+                                    computed_vecs = {}
+                                    if paths_to_embed:
+                                        if m_type == "dummy" or self.active_model_obj == "dummy":
+                                            for p in paths_to_embed:
+                                                v = np.random.rand(dim).astype(np.float32)
+                                                computed_vecs[p] = (v / np.linalg.norm(v)).tolist()
+                                        else:
+                                            import torch
+                                            from PIL import Image
+                                            with torch.no_grad():
+                                                self.active_model_obj.eval()
+                
+                                                # --- FIX: Explicitly load images, encode them, THEN close ---
+                                                images = []
+                                                valid_paths = []  # Track which paths successfully loaded
+                                                try:
+                                                    for p in paths_to_embed:
+                                                        try:
+                                                            img = Image.open(p)
+                                                            img.load()                       # force pixel decode while FD is open
+                                                            images.append(img.convert("RGB"))
+                                                            valid_paths.append(p)
+                                                        except Exception as img_err:
+                                                            # Skip corrupted/truncated frames gracefully
+                                                            self.log_diag(f"[VIDEO WARNING] Skipping corrupted frame {os.path.basename(p)}: {img_err}")
+                                                            if 'img' in locals():
+                                                                try: img.close()
+                                                                except Exception: pass
+                            
+                                                    # Encode while images are still open
+                                                    if images:
+                                                        features = self.active_model_obj.encode(images)
+                                                    else:
+                                                        features = np.array([])  # No valid images to encode 
+
+                                                finally:
+                                                    # Close images AFTER encoding is complete
+                                                    for img in images:
+                                                        try: img.close()
+                                                        except Exception: pass
+                
+                                                # Drop image references so their buffers can be freed
+                                                del images
+                
+                                                if len(features) > 0:
+                                                    if hasattr(features, "detach"):
+                                                        features = features.detach().cpu().numpy()
+                                                    features = np.array(features, dtype=np.float32)
+                                                    norms = np.linalg.norm(features, axis=1, keepdims=True)
+                                                    norms[norms == 0] = 1
+                                                    features = features / norms
+                                                    for idx, p in enumerate(valid_paths):
+                                                        computed_vecs[p] = features[idx].tolist()
+
+                                                # Release CUDA/CPU allocator caches periodically
+                                                del features
+                                                if torch.cuda.is_available():
+                                                    torch.cuda.empty_cache()
+
+                                    # Construct rows for upsert -> ONLY BUFFER NEW RECORDS
+                                    for idx, (key, path, f_file) in enumerate(zip(chunk_keys, chunk_paths, chunk_frame_files)):
+                                        if key in key_to_vec:
+                                            continue # Already in DB, skip to avoid merge_insert overhead and maintain deduplication
+                            
+                                        v_vec = computed_vecs[path]
+                                        meta = json.dumps({"source": os.path.basename(video_path), "frame_file": f_file, "type": "video_frame", "source_video": video_path, "fps": fps})
+                                        row_buffer.append({
+                                            "id": str(uuid.uuid4()),
+                                            "text_vector": [0.0] * dim,
+                                            "image_vector": [0.0] * dim,
+                                            "video_vector": v_vec,
+                                            "text": "",
+                                            "image_path": "",
+                                            "metadata": meta,
+                                            "text_hash": "",
+                                            "image_hash": "",
+                                            "metadata_hash": self._calc_hash(meta),
+                                            "empty_text": True,
+                                            "empty_image": True,
+                                            "empty_video": False,
+                                            "type": "video_frame",
+                                            "fps": fps,
+                                            "content_key": key
+                                        })
+
+                                    # Cleanup temp frames for this chunk immediately
+                                    for path in chunk_paths:
+                                        if os.path.exists(path):
+                                            os.remove(path)
+
+                                    ### diagnostics on terminal
+                                    print(f"video row_buffer status: {len(row_buffer)} / {buffer_limit}  ")
+                
+                                    # Trigger atomic append ONLY when threshold is reached
+                                    if len(row_buffer) >= buffer_limit:
+                                        self.table.add(row_buffer) # Use add() instead of merge_insert() for massive memory savings
+                                        row_buffer.clear()
+                                        gc.collect() # Force GC to reclaim memory from cleared buffer
+                                        QApplication.processEvents()
+
+                                    QApplication.processEvents()
+                    
+                                # Advance time for the next batch
+                                current_time += batch_duration
+
+                            # Cleanup temp directory for this video after ALL batches are processed
+                            if os.path.exists(video_dir):
+                                import shutil
+                                try:
+                                    shutil.rmtree(video_dir)
+                                except Exception as cleanup_err:
+                                    self.log_diag(f"[VIDEO WARNING] Failed to cleanup {video_dir}: {cleanup_err}")
                 
                 # Update progress (per video)
                 self.video_progress.setValue(current_video_idx)
