@@ -1,6 +1,4 @@
-Here is a pruned, user-focused version of your README. I removed the deep-dive optimization babble, condensed the GUI manual, and highlighted exactly what the tool does, who it is for, and how to get it running.
 
-***
 
 # Art-ref-RAG-server
 **Multimodal RAG Agent for Artists — Drawing Reference Server**
