@@ -4,7 +4,7 @@ CLIP-ViT-L-14 + LanceDB based RAG server for large-scale storage of artistic ref
 
 # Multimodal RAG Agent for Artists — Drawing Reference Server
 
-A general-purpose, hardware-friendly **Multimodal Retrieval-Augmented Generation (RAG) server** built originally for storing and searching drawing references for artists. It can ingest images (with optional companion textual metadata), PDFs (auto-converted to text + page images), CSV files, and videos (with frame sampling), and exposes a ZeroMQ TCP socket so any front-end application can perform semantic, full-text, hybrid, and cross-modal searches.
+A general-purpose, hardware-friendly **Multimodal Retrieval-Augmented Generation (RAG) server** built originally for storing and searching drawing references for artists. It can ingest images (with optional companion textual metadata), PDFs (auto-converted to text + page images), CSV files, compressed image archives and videos (with frame sampling), and exposes a ZeroMQ TCP socket so any front-end application can perform semantic, full-text, hybrid, and cross-modal searches.
 
 Results can be returned together with the actual image content pulled from local storage (or reconstructed on-demand for video frames and PDF page slices), making it ideal for building reference browsers, mood-board tools, or AI-assisted illustration assistants.
 
@@ -29,7 +29,7 @@ Results can be returned together with the actual image content pulled from local
 
 ## Key Features
 
-- **Multi-format ingestion**: PNG, JPG, JPEG, TIFF, WebP (auto-converted to PNG), PDF (PyMuPDF), CSV, plain text/code files, and videos (MP4, MKV, AVI).
+- **Multi-format ingestion**: PNG, JPG, JPEG, TIFF, WebP (auto-converted to PNG), PDF (PyMuPDF), CSV, plain text/code files, (zip, tar.gz, 7z) compressed image archives and videos (MP4, MKV, AVI).
 - **Companion metadata auto-association**: any `.txt` or `.json` file whose basename matches an image is automatically attached as searchable content.
 - **Tri-modal vector storage**: every record keeps separate `text_vector`, `image_vector`, and `video_vector` columns so you can query each modality independently.
 - **Six search modes** plus a default tri-vector hybrid fusion via Reciprocal Rank Fusion (RRF).
@@ -102,6 +102,8 @@ This system was conceived to run for long sessions on modest hardware (including
 - `pymupdf` — PDF extraction (only required for PDF ingestion)
 - `psutil` — memory diagnostics
 - `gc` — garbage collector
+- `pylance` — Lance
+- `py7zr` — 7z archives
 
 ---
 
@@ -215,7 +217,8 @@ Bulk ingestion from a folder.
 | **Use first CSV row as metadata fields** | Treats the CSV header as field names and stores typed values (int/float/string) in the metadata JSON. |
 | **CSV Batch Window** | Number of CSV rows to embed and flush together (hard-capped at 500 due to LanceDB's WHERE-condition limit). |
 | **Record Buffer Limit** | Global buffer threshold (in rows) before a LanceDB append is triggered. Higher = fewer writes but more RAM. |
-| **Text Embedding Batch / Image Embedding Batch / PDF Page Embedding Batch / Video Frame Embedding Batch** | Per-modality inference batch sizes. |
+| **Process compressed archives (zip/tar/7z)** | Process compressed image archives |
+| **Text Embedding Batch / Image Embedding Batch / PDF Page Embedding Batch / Archive Image Embedding Batch/ Video Frame Embedding Batch** | Per-modality inference batch sizes. |
 | **Enable Live Periodic Monitoring** | Spawns a background thread that re-scans the source folder every 10 seconds and ingests any new files. |
 | **Run Manual Batch Ingest Now** | Triggers a one-shot batch ingestion. |
 
