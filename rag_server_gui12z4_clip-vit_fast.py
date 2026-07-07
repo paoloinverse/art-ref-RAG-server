@@ -2275,7 +2275,13 @@ class RagAgentWindow(QMainWindow):
                         from PIL import Image
                         with torch.no_grad():
                             self.active_model_obj.eval()
-                            images = [Image.open(p).convert("RGB") for p in imgs_to_embed]
+                            images = []
+                            for p in imgs_to_embed:
+                                img = Image.open(p).convert("RGB")
+                                # Fix ambiguous channel dimension warning for extremely small images (e.g., 1px width/height)
+                                if img.width < 10 or img.height < 10:
+                                    img = img.resize((max(img.width, 10), max(img.height, 10)))
+                                images.append(img)
                             features = self.active_model_obj.encode(images)
                             if hasattr(features, "detach"):
                                 features = features.detach().cpu().numpy()
@@ -2313,6 +2319,9 @@ class RagAgentWindow(QMainWindow):
                     # Clean up extracted image immediately
                     if os.path.exists(img_path):
                         os.remove(img_path)
+
+                # Log buffer status after embedding and buffering the batch
+                self.log_diag(f"[ARCHIVE] Embedded {len(imgs_to_embed)} images. Buffer status: {len(row_buffer)}/{buffer_limit}")
 
                 # Trigger atomic append ONLY when threshold is reached
                 if len(row_buffer) >= buffer_limit:
