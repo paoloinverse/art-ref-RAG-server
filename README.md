@@ -7,13 +7,23 @@ Designed to run efficiently on modest hardware (including laptops) without overh
 
 ### 💡 What is it useful for?
 *   **Reference Browsers & Mood Boards:** Instantly find visual references using natural language or rough sketches.
-*   **AI-Assisted Illustration:** Feed semantic context to AI image generators (like ComfyUI) to maintain consistent art styles or poses.
 *   **Asset Management:** Organize and search through massive local libraries of images, PDFs, and video frames.
+
+Note: I created this as a tool to help artists quickly search for drawing references through large libraries. 
+At some point, looking through tens of thousands of images or videos to locate the exact reference you might remember was there, becomes too time-consuming and an actual chore.
+I felt the need to automate all of that and I wanted something very specific, and scalable to millions of records.
+
+My idea is to help with the search process, offering a much smaller subset of candidate references than can be searched by image (even by importing a quick hand-drawn sketch through a webcam) or by natural language, or by booru-style tags. 
+
+Images can also be imported with their own companion metadata files with additional textual descriptions of the contents. 
+
+Although this server can actually be integrated as part of a RAG agent in AI systems, that isn't its intended purpose, and there are better RAGs than this one for agentic use anyways. 
+
 
 ---
 
 ## ✨ Core Capabilities
-*   **Multi-format Ingestion:** PNG, JPG, TIFF, WebP, PDFs (auto-converted to text + images), CSVs, text/code files, compressed archives (zip/tar/7z), and Videos (MP4, MKV, AVI).
+*   **Multi-format Ingestion:** PNG, JPG, TIFF, WebP, PDFs (auto-converted to text + images), CSVs, text/code files, compressed image archives (zip/tar/7z), and Videos (MP4, MKV, AVI).
 *   **Smart Metadata:** Automatically associates `.txt` or `.json` files that share a basename with an image.
 *   **Versatile Search:** 8 distinct search modes, including text-to-image, image-to-image, sketch-to-image, and video frame search.
 *   **On-Demand Delivery:** Returns matching images (or reconstructed PDF/video frames) directly as Base64 in the JSON reply.
@@ -27,13 +37,13 @@ Designed to run efficiently on modest hardware (including laptops) without overh
 | Search Type | Query Modality | Description |
 | :--- | :--- | :--- |
 | **vector** *(default)* | Text or Image | Tri-vector Reciprocal Rank Fusion across all modalities. |
-| **fts** | Text (keywords) | Pure Full-Text Search. *(Requires building the FTS index first)*. |
+| **fts** | Text (keywords) | recommended: Pure Full-Text Search. *(Requires building the FTS index first)*. |
 | **hybrid** | Text | Combines semantic and keyword retrieval. |
-| **textontextvector** | Text | Semantic text-to-text similarity. |
-| **textonimagevector** | Text | Describe an image in words and find matching visuals. |
-| **imageonimagevector** | Image / Sketch | Search by reference image or a rough sketch. |
-| **textonvideovector** | Text | Find video frames matching a textual description. |
-| **imageonvideovector** | Image | Find video frames visually similar to a reference image. |
+| **textontextvector** | Text | recommended: Semantic text-to-text similarity. |
+| **textonimagevector** | Text | recommended: Describe an image in words and find matching visuals. |
+| **imageonimagevector** | Image / Sketch | recommended: Search by reference image or a rough sketch. |
+| **textonvideovector** | Text | recommended: Find video frames matching a textual description. |
+| **imageonvideovector** | Image | recommended: Find video frames visually similar to a reference image. |
 
 ---
 
@@ -96,14 +106,14 @@ python rag_agent_gui12z2_clip-vit_fast.py
 The GUI will open. By default, it starts with the **Dummy model** so you can test the ingestion and search pipeline immediately without downloading AI weights.
 
 ### 🧠 Available CLIP-ViT Models
-You can download and switch between models directly in the GUI. 
+You can download and switch between models directly in the GUI. The models are autodownloaded from Huggingface.
 
 | Model | Vector Dim | Best For |
 | :--- | :--- | :--- |
 | **Dummy** | 512 | Testing the pipeline without downloading weights. |
 | **CLIP ViT-B-32** | 512 | Fast, lightweight, battle-tested. Best starting point for English. |
-| **CLIP ViT-B-32 multilingual** | 512 | **Recommended** for Japanese or non-English metadata. |
-| **CLIP ViT-L-14** | 768 | Maximum accuracy. *(Note: Requires a new table due to 768 dim).* |
+| **CLIP ViT-B-32 multilingual** | 512 | **Recommended** for Japanese or non-English textual searches / metadata. |
+| **CLIP ViT-L-14** | 768 | **Recommended** for maximum accuracy. This is now my default choice.*(Note: Requires a new table due to 768 dim).* |
 
 ---
 
