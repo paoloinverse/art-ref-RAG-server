@@ -1,5 +1,5 @@
-# Art-ref-RAG-server
-**Multimodal RAG Agent for Artists — Drawing Reference Server**
+# Artistic Reference RAG server
+**Multimodal RAG Agent/Server for Artists — Drawing References Search Server**
 
 A general-purpose Multimodal Retrieval-Augmented Generation (RAG) server built for storing and searching artistic references. It ingests images, PDFs, videos, and text, and exposes a ZeroMQ TCP API so any front-end application can perform semantic, full-text, and cross-modal searches. 
 
