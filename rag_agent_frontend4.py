@@ -9,17 +9,73 @@ import shutil
 import re
 import subprocess
 import tempfile
+import glob
 
+import hashlib
+import threading
+import numpy as np
+
+import requests
+import cv2
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QSpinBox, QTextEdit, 
     QTabWidget, QListWidget, QGraphicsView, QGraphicsScene, 
     QSplitter, QMessageBox, QGroupBox, QFormLayout, QLineEdit,
-    QComboBox, QCheckBox, QListWidgetItem
+    QComboBox, QCheckBox, QListWidgetItem, QSlider, QScrollArea
 )
-from PySide6.QtCore import Qt, QThread, Signal, QRectF, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QRectF, QSize, QTimer, QBuffer, QByteArray
 from PySide6.QtGui import QPixmap, QImage, QWheelEvent, QMouseEvent, QGuiApplication
+
+class CameraManager:
+    """Singleton thread-safe wrapper for cv2.VideoCapture."""
+    _instance = None
+    _lock = threading.Lock()
+    
+    @classmethod
+    def get_instance(cls, device):
+        with cls._lock:
+            if not cls._instance or cls._instance.device != device:
+                if cls._instance and cls._instance.cap.isOpened():
+                    cls._instance.cap.release()
+                cls._instance = super().__new__(cls)
+             
+                backend = cv2.CAP_ANY
+                actual_device = device
+             
+                # Determine the best backend based on device string
+                if isinstance(device, str):
+                    if device.startswith("libcamera:"):
+                        # CSI / Modern laptop cameras managed by libcamera
+                        if hasattr(cv2, "CAP_LIBCAMERA"):
+                            backend = cv2.CAP_LIBCAMERA
+                        actual_device = int(device.split(":", 1)[1])
+                    elif os.name == 'posix' and device.startswith("/dev/video"):
+                        # Standard USB UVC webcams on Linux
+                        backend = cv2.CAP_V4L2
+             
+                cls._instance.cap = cv2.VideoCapture(actual_device, backend)
+                cls._instance.device = device
+                if not cls._instance.cap.isOpened():
+                    raise RuntimeError(f"Failed to open {device} (backend: {backend})")
+            return cls._instance
+
+    def read_frame(self):
+        with self._lock:
+            ret, frame = self.cap.read()
+            return ret, frame
+
+    def set_prop(self, prop, val):
+        with self._lock:
+            self.cap.set(prop, val)
+
+    @classmethod
+    def release(cls):
+        with cls._lock:
+            if cls._instance and cls._instance.cap.isOpened():
+                cls._instance.cap.release()
+                cls._instance = None
 
 
 def _get_frame_cache_dir():
@@ -69,9 +125,122 @@ def _extract_video_frame(metadata, cache_dir):
 
 
 
+def _parse_v4l2_controls(device):
+    """Parses v4l2-ctl output to heuristically generate a list of control dictionaries."""
+    try:
+        result = subprocess.run(["v4l2-ctl", "--list-ctrls-menus", "-d", device], 
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            return []
+        
+        controls = []
+        current_ctrl = None
+        
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Match standard int/menu controls
+            # e.g., "brightness 0x00980900 (int) : min=0 max=255 step=1 default=128 value=128"
+            match = re.match(r'(\w+)\s+(?:0x[0-9a-fA-F]+\s+)?\((int|menu)\)\s*:\s*min=(-?\d+)\s+max=(-?\d+)(?:\s+step=(-?\d+))?\s+default=(-?\d+)\s+value=(-?\d+)(.*)', line)
+            if match:
+                name, ctrl_type, min_val, max_val, step_val, default_val, value_val, rest = match.groups()
+                
+                props = {}
+                for m in re.finditer(r'(\w+)=([^ ]+)', rest or ""):
+                    props[m.group(1)] = m.group(2)
+                    
+                current_ctrl = {
+                    "name": name,
+                    "type": ctrl_type,
+                    "min": int(min_val),
+                    "max": int(max_val),
+                    "step": int(step_val) if step_val else 1,
+                    "default": int(default_val),
+                    "value": int(value_val),
+                    "flags": props.get("flags", ""),
+                    "menu_items": []
+                }
+                controls.append(current_ctrl)
+                continue
+                
+            # Match bool controls
+            # e.g., "focus_automatic_continuous 0x00980a25 (bool) : default=1 value=1"
+            match_bool = re.match(r'(\w+)\s+(?:0x[0-9a-fA-F]+\s+)?\(bool\)\s*:\s*default=(-?\d+)\s+value=(-?\d+)(.*)', line)
+            if match_bool:
+                name, default_val, value_val, rest = match_bool.groups()
+                props = {}
+                for m in re.finditer(r'(\w+)=([^ ]+)', rest or ""):
+                    props[m.group(1)] = m.group(2)
+                    
+                current_ctrl = {
+                    "name": name,
+                    "type": "bool",
+                    "min": 0,
+                    "max": 1,
+                    "step": 1,
+                    "default": int(default_val),
+                    "value": int(value_val),
+                    "flags": props.get("flags", ""),
+                    "menu_items": []
+                }
+                controls.append(current_ctrl)
+                continue
+                
+            # Match menu items
+            # e.g., "0: Manual Mode"
+            if current_ctrl and re.match(r'^\d+:', line):
+                match_menu = re.match(r'(\d+):\s+(.*)', line)
+                if match_menu:
+                    current_ctrl["menu_items"].append((int(match_menu.group(1)), match_menu.group(2)))
+                    
+        return controls
+    except Exception as e:
+        print(f"[V4L2] Error parsing controls: {e}")
+        return []
+
+def _set_v4l2_control(device, name, value):
+    """Sets a V4L2 control using v4l2-ctl directly."""
+    try:
+        subprocess.run(["v4l2-ctl", "-d", device, "--set-ctrl", f"{name}={value}"], 
+                       capture_output=True, text=True, timeout=5)
+    except Exception as e:
+        print(f"[V4L2] Failed to set control {name}: {e}")
+
+def _parse_v4l2_formats(device):
+    """Parses v4l2-ctl --list-formats-ext output to get available pixel formats and frame sizes."""
+    formats = []
+    try:
+        result = subprocess.run(["v4l2-ctl", "-d", device, "--list-formats-ext"],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            return formats
+        
+        current_format = None
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            # Match format line, e.g., "[0]: 'YUYV' (YUYV 4:2:2)"
+            match_fmt = re.search(r"\[\d+\]:\s*'([^']+)'", line)
+            if match_fmt:
+                current_format = match_fmt.group(1)
+                formats.append({"format": current_format, "sizes": []})
+                continue
+            
+            match_size = re.search(r"Size\s*:\s*Discrete\s+(\d+x\d+)", line)
+            if match_size and current_format:
+                size_str = match_size.group(1)
+                if size_str not in formats[-1]["sizes"]:
+                    formats[-1]["sizes"].append(size_str)
+    except Exception as e:
+        print(f"[V4L2] Error parsing formats: {e}")
+    return formats
+
+
 # =====================================================================
 # CLEAN ZMQ WORKER (RAG CLIENT)
 # =====================================================================
+
 
 class ZmqConfigThread(QThread):
     """Stateless worker for RAG configuration commands."""
@@ -116,10 +285,11 @@ class ZmqSearchThread(QThread):
     finished_signal = Signal(dict, str)
     error_signal = Signal(str, str)
 
-    def __init__(self, text_query, image_path, limit, search_type, target_address, request_id="local_gui", timeout_ms=60000):
+    def __init__(self, text_query, image_path, image_b64, limit, search_type, target_address, request_id="local_gui", timeout_ms=60000):
         super().__init__()
         self.text_query = text_query
         self.image_path = image_path
+        self.image_b64 = image_b64
         self.limit = limit
         self.search_type = search_type
         self.target_address = target_address
@@ -136,8 +306,8 @@ class ZmqSearchThread(QThread):
         try:
             socket.connect(self.target_address)
 
-            img_b64 = ""
-            if self.image_path and os.path.exists(self.image_path):
+            img_b64 = self.image_b64
+            if not img_b64 and self.image_path and os.path.exists(self.image_path):
                 with open(self.image_path, "rb") as f:
                     img_b64 = base64.b64encode(f.read()).decode('utf-8')
 
@@ -443,7 +613,7 @@ class DiagnosticWindow(QWidget):
 
 
 class ImageInputWidget(QLabel):
-    image_loaded = Signal(str)
+    image_loaded = Signal(str, str) # path, base64_data
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -484,9 +654,11 @@ class ImageInputWidget(QLabel):
             if mime_data.hasImage():
                 pixmap = clipboard.pixmap()
                 if not pixmap.isNull():
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                        pixmap.save(tmp.name, "PNG")
-                        self.load_image_from_path(tmp.name)
+                    byte_array = QByteArray()
+                    buffer = QBuffer(byte_array)
+                    buffer.open(QBuffer.WriteOnly)
+                    pixmap.save(buffer, "PNG")
+                    self.load_image_from_bytes(byte_array.data(), "clipboard.png")
             # Handle copied file reference from OS file manager
             elif mime_data.hasUrls():
                 urls = mime_data.urls()
@@ -499,9 +671,22 @@ class ImageInputWidget(QLabel):
         pixmap = QPixmap(path)
         if not pixmap.isNull():
             self.set_pixmap_scaled(pixmap)
-            self.image_loaded.emit(path)
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode('utf-8')
+            self.image_loaded.emit(path, b64)
         else:
             self.setText("Failed to load image.")
+
+    def load_image_from_bytes(self, image_bytes: bytes, source_name: str = "capture.jpg"):
+        pixmap = QPixmap()
+        if pixmap.loadFromData(image_bytes):
+            self.set_pixmap_scaled(pixmap)
+            b64 = base64.b64encode(image_bytes).decode('utf-8')
+            self.image_loaded.emit(source_name, b64)
+            return True
+        else:
+            self.setText("Failed to load image.")
+            return False
 
     def set_pixmap_scaled(self, pixmap):
         scaled_pixmap = pixmap.scaled(
@@ -515,12 +700,376 @@ class ImageInputWidget(QLabel):
 # =====================================================================
 # REFINED RAG FRONT-END
 # =====================================================================
+
+class CameraDiscoveryThread(QThread):
+    """Background worker to scan for cameras without blocking the UI."""
+    finished_signal = Signal(list)
+
+    def run(self):
+        devices = []
+        if os.name == "posix":
+            try:
+                # Increased timeout and relies on v4l2-ctl to prevent OpenCV FFMPEG spam
+                out = subprocess.check_output(["v4l2-ctl", "--list-devices"], text=True, timeout=5)
+                current_name = ""
+                for line in out.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("/dev/video"):
+                        # Only add /dev/video devices, skip /dev/media or others
+                        devices.append((stripped, current_name or stripped))
+                    elif stripped and not stripped.startswith("/dev/"):
+                        # It's a camera name
+                        current_name = stripped
+            except Exception:
+                # Fallback: test each /dev/video* with CAP_V4L2, suppressing OpenCV spam
+                import sys as _sys
+                old_stdout = _sys.stdout
+                old_stderr = _sys.stderr
+                _sys.stdout = open(os.devnull, 'w')
+                _sys.stderr = open(os.devnull, 'w')
+                try:
+                    for d in sorted(glob.glob("/dev/video*")):
+                        cap = cv2.VideoCapture(d, cv2.CAP_V4L2)
+                        if cap.isOpened():
+                            devices.append((d, d))
+                            cap.release()
+                finally:
+                    _sys.stdout.close()
+                    _sys.stderr.close()
+                    _sys.stdout = old_stdout
+                    _sys.stderr = old_stderr
+                 
+        # Libcamera discovery (CSI / Modern laptop cameras)
+        try:
+            libcamera_cmd = None
+            if shutil.which("rpicam-vid"):
+                libcamera_cmd = ["rpicam-vid", "--list-cameras"]
+            elif shutil.which("libcamera-vid"):
+                libcamera_cmd = ["libcamera-vid", "--list-cameras"]
+         
+            if libcamera_cmd:
+                out = subprocess.check_output(libcamera_cmd, text=True, timeout=5)
+                # Parse output like: "0 : imx219 [/base/...]"
+                for match in re.finditer(r"(\d+)\s*:\s*([^\[]+)\[([^\]]+)\]", out):
+                    idx = match.group(1)
+                    name = match.group(2).strip()
+                    # Use a special prefix so CameraManager knows to use CAP_LIBCAMERA
+                    devices.append((f"libcamera:{idx}", f"[CSI/libcamera] {name} ({idx})"))
+        except Exception as e:
+            print(f"[Discovery] libcamera enumeration failed or not available: {e}")
+
+        # Fallback for Windows/macOS or if no V4L2/libcamera devices found
+        if not devices:
+            import sys as _sys
+            old_stdout = _sys.stdout
+            old_stderr = _sys.stderr
+            _sys.stdout = open(os.devnull, 'w')
+            _sys.stderr = open(os.devnull, 'w')
+            try:
+                for i in range(16):
+                    cap = cv2.VideoCapture(i)
+                    if cap.isOpened():
+                        devices.append((i, f"Camera Index {i}"))
+                        cap.release()
+            finally:
+                _sys.stdout.close()
+                _sys.stderr.close()
+                _sys.stdout = old_stdout
+                _sys.stderr = old_stderr
+                    
+        self.finished_signal.emit(devices)
+
+class UvcCameraControlsWindow(QWidget):
+    def __init__(self, camera_device):
+        super().__init__()
+        self.setWindowTitle(f"V4L2 Camera Controls - {camera_device}")
+        self.resize(800, 600)
+        self.camera_device = camera_device
+        
+        try:
+            self.cam_mgr = CameraManager.get_instance(camera_device)
+        except RuntimeError as e:
+            QMessageBox.critical(self, "Camera Error", str(e))
+            self.close()
+            return
+
+        self.layout = QVBoxLayout(self)
+        
+        # Preview Label
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(self.preview_label, 1)
+        
+        # Scrollable Controls Area
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        controls_container = QWidget()
+        self.controls_layout = QVBoxLayout(controls_container)
+        scroll_area.setWidget(controls_container)
+        self.layout.addWidget(scroll_area)
+
+        # Add Stream Format and Resolution Controls
+        self._populate_stream_controls()
+
+        # Populate controls based on OS
+        print(f"checking os.name:{os.name}")
+        # Skip native v4l2 controls for libcamera devices as they are managed differently
+        if os.name == "posix" and not str(self.camera_device).startswith("libcamera:"):
+            print(f"running the native v4l2 controls")
+            self._populate_v4l2_controls()
+        else:
+            self._populate_basic_opencv_controls()
+            
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_frame)
+        self.timer.start(30)
+
+    def _populate_stream_controls(self):
+        fmt_group = QGroupBox("Stream Format & Resolution")
+        fmt_layout = QHBoxLayout(fmt_group)
+        
+        fmt_layout.addWidget(QLabel("Format:"))
+        self.combo_fmt = QComboBox()
+        fmt_layout.addWidget(self.combo_fmt)
+        
+        fmt_layout.addWidget(QLabel("Resolution:"))
+        self.combo_res = QComboBox()
+        fmt_layout.addWidget(self.combo_res)
+        
+        self.btn_apply_fmt = QPushButton("Apply")
+        self.btn_apply_fmt.clicked.connect(self.apply_format_and_resolution)
+        fmt_layout.addWidget(self.btn_apply_fmt)
+        
+        self.controls_layout.addWidget(fmt_group)
+        
+        if os.name == "posix":
+            self.formats = _parse_v4l2_formats(self.camera_device)
+            if self.formats:
+                for fmt in self.formats:
+                    self.combo_fmt.addItem(fmt["format"])
+                self.combo_fmt.currentIndexChanged.connect(self.update_resolution_combo)
+                if self.combo_fmt.count() > 0:
+                    self.update_resolution_combo(0)
+            else:
+                self.combo_fmt.addItem("Default")
+                self.combo_res.addItem("Default")
+        else:
+            self.combo_fmt.addItems(["Default", "MJPG", "YUYV"])
+            self.combo_res.addItems(["Default", "640x480", "1280x720", "1920x1080"])
+
+    def update_resolution_combo(self, index):
+        self.combo_res.clear()
+        if hasattr(self, 'formats') and self.formats and index < len(self.formats):
+            sizes = self.formats[index]["sizes"]
+            if sizes:
+                self.combo_res.addItems(sizes)
+            else:
+                self.combo_res.addItem("Default")
+        else:
+            self.combo_res.addItem("Default")
+
+    def apply_format_and_resolution(self):
+        fmt_text = self.combo_fmt.currentText()
+        res_text = self.combo_res.currentText()
+        
+        try:
+            if fmt_text != "Default":
+                fourcc = cv2.VideoWriter_fourcc(*fmt_text[:4])
+                self.cam_mgr.set_prop(cv2.CAP_PROP_FOURCC, fourcc)
+                
+            if res_text != "Default":
+                w, h = map(int, res_text.split('x'))
+                self.cam_mgr.set_prop(cv2.CAP_PROP_FRAME_WIDTH, w)
+                self.cam_mgr.set_prop(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                
+            QMessageBox.information(self, "Settings Applied", f"Format: {fmt_text}, Resolution: {res_text}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to apply settings: {e}")
+
+    def _populate_v4l2_controls(self):
+        """Heuristically enumerate and create widgets for all available V4L2 controls."""
+        # Check if v4l2-ctl is available
+        if not shutil.which("v4l2-ctl"):
+            self._populate_basic_opencv_controls()
+            return
+
+        self.controls = _parse_v4l2_controls(self.camera_device)
+        
+        if not self.controls:
+            self._populate_basic_opencv_controls()
+            return
+            
+        # Group controls by prefix (e.g., "auto_exposure", "exposure_absolute" -> "Exposure Controls")
+        groups = {}
+        for ctrl in self.controls:
+            group_name = ctrl["name"].split("_")[0].title() + " Controls"
+            if group_name not in groups:
+                groups[group_name] = []
+            groups[group_name].append(ctrl)
+
+        for group_name, ctrls in groups.items():
+            grp_box = QGroupBox(group_name)
+            form_layout = QFormLayout(grp_box)
+            
+            for ctrl in ctrls:
+                if ctrl["type"] == "menu":
+                    combo = QComboBox()
+                    for val, text in ctrl["menu_items"]:
+                        combo.addItem(text, val)
+                    # Set current value
+                    idx = combo.findData(ctrl["value"])
+                    if idx != -1:
+                        combo.setCurrentIndex(idx)
+                    combo.currentIndexChanged.connect(lambda v, c=combo, n=ctrl["name"]: self._on_menu_changed(n, c.itemData(v)))
+                    form_layout.addRow(ctrl["name"].replace("_", " ").title(), combo)
+                    
+                elif ctrl["type"] in ("int", "slider"):
+                    slider = QSlider(Qt.Horizontal)
+                    slider.setMinimum(ctrl["min"])
+                    slider.setMaximum(ctrl["max"])
+                    slider.setValue(ctrl["value"])
+                    
+                    spin = QSpinBox()
+                    spin.setMinimum(ctrl["min"])
+                    spin.setMaximum(ctrl["max"])
+                    spin.setValue(ctrl["value"])
+                    
+                    slider.valueChanged.connect(spin.setValue)
+                    spin.valueChanged.connect(slider.setValue)
+                    spin.valueChanged.connect(lambda v, n=ctrl["name"]: self._on_slider_changed(n, v))
+                    
+                    row_layout = QHBoxLayout()
+                    row_layout.addWidget(slider)
+                    row_layout.addWidget(spin)
+                    form_layout.addRow(ctrl["name"].replace("_", " ").title(), row_layout)
+                    
+                elif ctrl["type"] == "bool":
+                    chk = QCheckBox()
+                    chk.setChecked(ctrl["value"] == 1)
+                    chk.stateChanged.connect(lambda s, n=ctrl["name"]: self._on_bool_changed(n, s))
+                    form_layout.addRow(ctrl["name"].replace("_", " ").title(), chk)
+
+            self.controls_layout.addWidget(grp_box)
+            
+        # Add a "Reset to Defaults" button
+        btn_reset = QPushButton("Reset to Defaults")
+        btn_reset.clicked.connect(self._reset_to_defaults)
+        self.controls_layout.addWidget(btn_reset)
+        self.controls_layout.addStretch()
+
+    def _populate_basic_opencv_controls(self):
+        print(f"falling back to _populate_basic_opencv_controls(self)")
+        """Fallback for Windows/Mac or missing v4l2-ctl."""
+        grp_box = QGroupBox("Basic OpenCV Controls")
+        form_layout = QFormLayout(grp_box)
+        
+        # Continuous Sliders
+        props_slider = {
+            "Brightness": cv2.CAP_PROP_BRIGHTNESS,
+            "Contrast": cv2.CAP_PROP_CONTRAST,
+            "Saturation": cv2.CAP_PROP_SATURATION,
+            "Hue": cv2.CAP_PROP_HUE,
+            "Gain": cv2.CAP_PROP_GAIN,
+            "Exposure": cv2.CAP_PROP_EXPOSURE
+        }
+        
+        self.sliders = {}
+        for name, prop in props_slider.items():
+            slider = QSlider(Qt.Horizontal)
+            val = int(self.cam_mgr.cap.get(prop))
+            slider.setValue(val)
+            slider.valueChanged.connect(lambda v, p=prop: self.cam_mgr.set_prop(p, v))
+            form_layout.addRow(name, slider)
+            self.sliders[name] = slider
+            
+        # Auto/Manual Toggles
+        toggle_group = QGroupBox("Auto/Manual Controls")
+        t_layout = QVBoxLayout(toggle_group)
+        toggles = {
+            "Auto Focus": cv2.CAP_PROP_AUTOFOCUS,
+            "Auto Exposure": cv2.CAP_PROP_AUTO_EXPOSURE,
+            "Auto White Balance": cv2.CAP_PROP_AUTO_WB
+        }
+        self.toggles = {}
+        for name, prop in toggles.items():
+            chk = QCheckBox(name)
+            val = self.cam_mgr.cap.get(prop)
+            
+            if prop == cv2.CAP_PROP_AUTO_EXPOSURE:
+                is_auto = (val > 0.5)
+            else:
+                is_auto = (val == 1.0 or val > 0)
+             
+            chk.setChecked(is_auto)
+            chk.stateChanged.connect(lambda s, p=prop: self.toggle_camera_prop(p, s))
+            t_layout.addWidget(chk)
+            self.toggles[name] = chk
+            
+        form_layout.addRow("", toggle_group)
+        self.controls_layout.addWidget(grp_box)
+        self.controls_layout.addStretch()
+
+    def _on_slider_changed(self, name, value):
+        _set_v4l2_control(self.camera_device, name, value)
+
+    def _on_menu_changed(self, name, value):
+        _set_v4l2_control(self.camera_device, name, value)
+
+    def _on_bool_changed(self, name, state):
+        # Handle both int (legacy/Qt5) and Qt.CheckState enum (PySide6/Qt6)
+        is_checked = (state == Qt.CheckState.Checked) or (state == 2)
+        val = 1 if is_checked else 0
+        _set_v4l2_control(self.camera_device, name, val)
+
+    def _reset_to_defaults(self):
+        if hasattr(self, 'controls'):
+            for ctrl in self.controls:
+                if "default" in ctrl:
+                    _set_v4l2_control(self.camera_device, ctrl["name"], ctrl["default"])
+
+    def toggle_camera_prop(self, prop, state):
+        """Map checkbox state to OpenCV enum (Fallback method)"""
+        # Handle both int (legacy/Qt5) and Qt.CheckState enum (PySide6/Qt6)
+        is_checked = (state == Qt.CheckState.Checked) or (state == 2)
+        if prop == cv2.CAP_PROP_AUTO_EXPOSURE:
+            val = 0.75 if is_checked else 0.25
+        else:
+            val = 1.0 if is_checked else 0.0
+         
+        self.cam_mgr.set_prop(prop, val)
+     
+        if prop == cv2.CAP_PROP_AUTO_EXPOSURE:
+            actual = self.cam_mgr.cap.get(prop)
+            if is_checked and actual < 0.5:
+                self.cam_mgr.set_prop(prop, 1.0)
+            elif not is_checked and actual > 0.5:
+                self.cam_mgr.set_prop(prop, 0.0)
+
+    def update_frame(self):
+        ret, frame = self.cam_mgr.read_frame()
+        if ret:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = frame.shape
+            bytes_per_line = ch * w
+            q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img).scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.preview_label.setPixmap(pixmap)
+            
+    def closeEvent(self, event):
+        self.timer.stop()
+        event.accept()
+
+
+# =====================================================================
+# REFINED RAG FRONT-END
+# =====================================================================
 class RagFrontEnd(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RAG Vector DB Manager")
+        self.setWindowTitle("RAG Vector DB FrontEnd")
         self.resize(800, 600)
         self.selected_image_path = ""
+        self.selected_image_b64 = ""
         self.last_results = None
         self.active_search = None
 
@@ -572,7 +1121,7 @@ class RagFrontEnd(QMainWindow):
         btn_box.addWidget(self.btn_run_img)
         btn_box.addWidget(self.btn_run_multi)
         
-        self.btn_diag = QPushButton("Open Diagnostic Viewer")
+        self.btn_diag = QPushButton("Open Search Results Viewer")
         self.btn_diag.setEnabled(False)
         self.btn_diag.clicked.connect(self.open_diag)
         
@@ -608,9 +1157,61 @@ class RagFrontEnd(QMainWindow):
         c_layout.addRow("Result Limit:", self.cfg_limit)
         c_layout.addRow("Remote Table:", table_layout)
         
+        config_io_layout = QHBoxLayout()
+        btn_export_cfg = QPushButton("Export Config")
+        btn_import_cfg = QPushButton("Import Config")
+        btn_export_cfg.clicked.connect(self.export_config)
+        btn_import_cfg.clicked.connect(self.import_config)
+        config_io_layout.addWidget(btn_export_cfg)
+        config_io_layout.addWidget(btn_import_cfg)
+        c_layout.addRow("Configuration File:", config_io_layout)
+        
         self.tabs.addTab(cfg_tab, "Configuration")
 
-
+        # Tab 3: Image Capture
+        cap_tab = QWidget()
+        cap_layout = QVBoxLayout(cap_tab)
+        
+        # ESP32-CAM
+        esp_group = QGroupBox("ESP32-CAM Capture")
+        esp_layout = QHBoxLayout(esp_group)
+        esp_layout.addWidget(QLabel("URL:"))
+        self.esp32_url_input = QLineEdit("http://192.168.5.1/capture")
+        esp_layout.addWidget(self.esp32_url_input)
+        self.btn_esp32_capture = QPushButton("Capture from ESP32")
+        self.btn_esp32_capture.clicked.connect(self.capture_esp32)
+        esp_layout.addWidget(self.btn_esp32_capture)
+        
+        self.btn_esp32_settings = QPushButton("Open ESP32 Web UI")
+        self.btn_esp32_settings.clicked.connect(self.open_esp32_settings)
+        esp_layout.addWidget(self.btn_esp32_settings)
+        cap_layout.addWidget(esp_group)
+        
+        # UVC Webcam
+        uvc_group = QGroupBox("UVC Webcam Capture")
+        uvc_layout = QHBoxLayout(uvc_group)
+        uvc_layout.addWidget(QLabel("Camera:"))
+        self.uvc_combo = QComboBox()
+        self.populate_uvc_cameras()
+        uvc_layout.addWidget(self.uvc_combo)
+        self.btn_uvc_capture = QPushButton("Capture from Webcam")
+        self.btn_uvc_capture.clicked.connect(self.capture_uvc)
+        uvc_layout.addWidget(self.btn_uvc_capture)
+        self.btn_uvc_controls = QPushButton("Camera Controls")
+        self.btn_uvc_controls.clicked.connect(self.open_uvc_controls)
+        uvc_layout.addWidget(self.btn_uvc_controls)
+        cap_layout.addWidget(uvc_group)
+        
+        # Shared capture option
+        opt_layout = QHBoxLayout()
+        self.chk_save_capture = QCheckBox("Save captured image to disk (run directory)")
+        self.chk_save_capture.setChecked(False)
+        opt_layout.addWidget(self.chk_save_capture)
+        opt_layout.addStretch()
+        cap_layout.addLayout(opt_layout)
+        
+        cap_layout.addStretch()
+        self.tabs.addTab(cap_tab, "Image Capture")
 
         self.status = QLabel("Ready")
         layout.addWidget(self.status)
@@ -621,12 +1222,14 @@ class RagFrontEnd(QMainWindow):
 #            self.selected_image_path = path
 #            self.lbl_img.setText(os.path.basename(path))
 
-    def on_image_selected(self, path):
+    def on_image_selected(self, path, b64_data):
         self.selected_image_path = path
+        self.selected_image_b64 = b64_data
         self.status.setText(f"Image selected: {os.path.basename(path)}")
 
     def clear_image(self):
         self.selected_image_path = ""
+        self.selected_image_b64 = ""
         self.img_input_widget.clear()
         self.img_input_widget.setText("Click, Drop, or Ctrl+V to select image")
         self.status.setText("Image cleared.")
@@ -643,16 +1246,18 @@ class RagFrontEnd(QMainWindow):
         
         # Filter inputs based on selected button mode
         text_payload = self.inp_query.text() if mode in ("text", "multi") else ""
-        img_payload = self.selected_image_path if mode in ("image", "multi") else ""
+        img_payload_path = self.selected_image_path if mode in ("image", "multi") else ""
+        img_payload_b64 = self.selected_image_b64 if mode in ("image", "multi") else ""
         
-        if mode == "image" and not img_payload:
+        if mode == "image" and not img_payload_b64:
             QMessageBox.warning(self, "Input Error", "Please select an image first.")
             self.toggle_search_buttons(True)
             return
             
         self.active_search = ZmqSearchThread(
             text_query=text_payload,
-            image_path=img_payload,
+            image_path=img_payload_path,
+            image_b64=img_payload_b64,
             limit=self.cfg_limit.value(),
             search_type=self.combo_strategy.currentText(),
             target_address=addr
@@ -739,6 +1344,169 @@ class RagFrontEnd(QMainWindow):
         self.btn_fetch_dbs.setEnabled(True)
         self.btn_load_db.setEnabled(True)
         self.status.setText(f"ZMQ Error: {msg}")
+
+    def populate_uvc_cameras(self):
+        self.uvc_combo.clear()
+        self.uvc_combo.addItem("Scanning for cameras...", None)
+        self.uvc_combo.setEnabled(False)
+        
+        self.cam_discovery_thread = CameraDiscoveryThread()
+        self.cam_discovery_thread.finished_signal.connect(self.on_cameras_discovered)
+        self.cam_discovery_thread.start()
+
+    def on_cameras_discovered(self, devices):
+        self.uvc_combo.clear()
+        self.uvc_combo.setEnabled(True)
+        if not devices:
+            self.uvc_combo.addItem("No cameras found", None)
+        else:
+            for dev_path, dev_name in devices:
+                self.uvc_combo.addItem(dev_name, dev_path)
+
+    def open_esp32_settings(self):
+        url = self.esp32_url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Input Error", "Please enter a URL.")
+            return
+        
+        from urllib.parse import urlparse
+        import webbrowser
+        
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            QMessageBox.warning(self, "Input Error", "Invalid URL. Please include http:// or https://")
+            return
+            
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        webbrowser.open(base_url)
+        self.status.setText(f"Opened ESP32 Web UI at {base_url}")
+
+    def capture_esp32(self):
+        url = self.esp32_url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Input Error", "Please enter a URL.")
+            return
+            
+        self.status.setText("Capturing from ESP32-CAM...")
+        QApplication.processEvents()
+        try:
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            
+            img_data = response.content
+            
+            # Validate image to handle partial/broken data
+            nparr = np.frombuffer(img_data, np.uint8)
+            img_decode = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img_decode is None:
+                raise ValueError("Received data is not a valid image (possibly partial or broken stream).")
+                
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            frame_hash = hashlib.md5(img_data).hexdigest()[:8]
+            source_name = f"esp32_{ts}_{frame_hash}.jpg"
+            
+            if self.img_input_widget.load_image_from_bytes(img_data, source_name):
+                if self.chk_save_capture.isChecked():
+                    save_path = os.path.join(os.getcwd(), f"capture_{source_name}")
+                    with open(save_path, "wb") as f:
+                        f.write(img_data)
+                    self.status.setText(f"Saved to {save_path}")
+                else:
+                    self.status.setText("ESP32-CAM image captured to memory.")
+            else:
+                raise ValueError("Failed to load image into preview widget.")
+                
+        except requests.exceptions.RequestException as e:
+            self.status.setText(f"Network Error: {str(e)}")
+            QMessageBox.critical(self, "Capture Error", f"Network error: {str(e)}")
+        except ValueError as e:
+            self.status.setText(f"Image Error: {str(e)}")
+            QMessageBox.critical(self, "Capture Error", str(e))
+        except Exception as e:
+            self.status.setText(f"Error: {str(e)}")
+            QMessageBox.critical(self, "Capture Error", str(e))
+
+    def capture_uvc(self):
+        cam_device = self.uvc_combo.currentData()
+        if cam_device is None:
+            QMessageBox.warning(self, "Input Error", "No camera selected.")
+            return
+            
+        self.status.setText("Capturing from UVC Webcam...")
+        QApplication.processEvents()
+        
+        try:
+            cam_mgr = CameraManager.get_instance(cam_device)
+            ret, frame = cam_mgr.read_frame()
+            
+            if ret:
+                _, buffer = cv2.imencode(".png", frame)
+                img_data = buffer.tobytes()
+                
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                frame_hash = hashlib.md5(img_data).hexdigest()[:8]
+                source_name = f"uvc_{ts}_{frame_hash}.png"
+                
+                if self.img_input_widget.load_image_from_bytes(img_data, source_name):
+                    if self.chk_save_capture.isChecked():
+                        save_path = os.path.join(os.getcwd(), f"capture_{source_name}")
+                        with open(save_path, "wb") as f:
+                            f.write(img_data)
+                        self.status.setText(f"Saved to {save_path}")
+                    else:
+                        self.status.setText(f"Frame captured to memory ({ts}_{frame_hash})")
+                else:
+                    raise ValueError("Failed to load frame into preview widget.")
+            else:
+                QMessageBox.critical(self, "Capture Error", "Failed to read frame.")
+        except Exception as e:
+            self.status.setText(f"Error: {str(e)}")
+            QMessageBox.critical(self, "Capture Error", str(e))
+
+
+    def open_uvc_controls(self):
+        cam_device = self.uvc_combo.currentData()
+        if cam_device is None:
+            QMessageBox.warning(self, "Input Error", "No camera selected.")
+            return
+        self.uvc_controls_window = UvcCameraControlsWindow(cam_device)
+        self.uvc_controls_window.show()
+
+
+    def export_config(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Configuration", "", "JSON Files (*.json)")
+        if not path: return
+        
+        config_data = {
+            "rag_server_ip": self.cfg_ip.text(),
+            "rag_server_port": self.cfg_port.text(),
+            "result_limit": self.cfg_limit.value(),
+            "esp32_url": self.esp32_url_input.text()
+        }
+        
+        try:
+            with open(path, 'w') as f:
+                json.dump(config_data, f, indent=4)
+            self.status.setText(f"Configuration exported to {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
+    def import_config(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Configuration", "", "JSON Files (*.json)")
+        if not path: return
+        
+        try:
+            with open(path, 'r') as f:
+                config_data = json.load(f)
+                
+            self.cfg_ip.setText(config_data.get("rag_server_ip", "127.0.0.1"))
+            self.cfg_port.setText(config_data.get("rag_server_port", "5001"))
+            self.cfg_limit.setValue(config_data.get("result_limit", 256))
+            self.esp32_url_input.setText(config_data.get("esp32_url", "http://192.168.5.1/capture"))
+            
+            self.status.setText(f"Configuration imported from {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", str(e))
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
