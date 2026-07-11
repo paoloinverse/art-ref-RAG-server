@@ -1335,6 +1335,8 @@ class RagAgentWindow(QMainWindow):
             # Construct rows and buffer them
             rows = []
             for t, m, h in zip(unique_texts, unique_metas, unique_hashes):
+                if h in hash_to_vec:
+                    continue # Skip texts that already exist in the database
                 vec = hash_to_vec.get(h, computed_vectors.get(t, [0.0] * dim))
                 rows.append({
                     "id": str(uuid.uuid4()),
@@ -1423,15 +1425,13 @@ class RagAgentWindow(QMainWindow):
             # Build rows and buffer them
             for path, ih, th, mh in zip(img_paths, img_hashes, text_hashes, meta_hashes):
                 if ih in hash_to_vec:
-                    i_vec = hash_to_vec[ih]
+                    continue # Skip images that already exist in the database
                 elif path in computed_vectors:
                     i_vec = computed_vectors[path]
                 else:
                     i_vec = [0.0] * dim
-                    
                 t_vec = [0.0] * dim
                 meta = json.dumps({"source": os.path.basename(path), "type": "image_batch"})
-                
                 self._accumulate_and_flush("image_hash", [{
                     "id": str(uuid.uuid4()),
                     "text_vector": t_vec,
@@ -1852,7 +1852,8 @@ class RagAgentWindow(QMainWindow):
             if img_hash:
                 match = self.table.search().where(f"image_hash = '{img_hash}'").limit(1).to_pandas()
                 if len(match) > 0:
-                    hash_to_vec['image'] = match['image_vector'].iloc[0]
+                    self.log_diag(f"[DEDUP] Image {os.path.basename(path)} already exists in DB. Skipping.")
+                    return
                     
             if text_hash:
                 match = self.table.search().where(f"text_hash = '{text_hash}'").limit(1).to_pandas()
@@ -2084,9 +2085,16 @@ class RagAgentWindow(QMainWindow):
                 # Construct rows and clean up images immediately
                 batch_rows = []
                 for page_num, text, img_path, key, meta_img in page_buffer_data:
+                    # Clean up extracted page image immediately to prevent RAM disk saturation
+                    if os.path.exists(img_path):
+                        os.remove(img_path)
+                        
+                    # Skip pages that already exist in the database
+                    if key in key_to_img_vec:
+                        continue
+                        
                     i_vec = key_to_img_vec.get(key, computed_img_vecs.get(img_path, [0.0] * dim))
                     t_vec = key_to_txt_vec.get(key, computed_txt_vecs.get(text, [0.0] * dim))
-
                     batch_rows.append({
                         "id": str(uuid.uuid4()),
                         "text_vector": t_vec,
@@ -2105,10 +2113,7 @@ class RagAgentWindow(QMainWindow):
                         "fps": 0.0,
                         "content_key": key
                     })
-
-                    # Clean up extracted page image immediately to prevent RAM disk saturation
-                    if os.path.exists(img_path):
-                        os.remove(img_path)
+    
 
                 # Accumulate rows into global buffer and flush when full
                 self._accumulate_and_flush("content_key", batch_rows)
@@ -2308,9 +2313,16 @@ class RagAgentWindow(QMainWindow):
                 # Construct rows and clean up images immediately
                 batch_rows = []
                 for internal_name, text, img_path, key, meta_img in page_buffer_data:
+                    # Clean up extracted image immediately
+                    if os.path.exists(img_path):
+                        os.remove(img_path)
+                        
+                    # Skip images that already exist in the database
+                    if key in key_to_img_vec:
+                        continue
+                        
                     i_vec = key_to_img_vec.get(key, computed_img_vecs.get(img_path, [0.0] * dim))
                     t_vec = [0.0] * dim # Archives primarily contain images, no text extraction yet
-
                     batch_rows.append({
                         "id": str(uuid.uuid4()),
                         "text_vector": t_vec,
@@ -2329,10 +2341,6 @@ class RagAgentWindow(QMainWindow):
                         "fps": 0.0,
                         "content_key": key
                     })
-
-                    # Clean up extracted image immediately
-                    if os.path.exists(img_path):
-                        os.remove(img_path)
 
                 # Log buffer status after embedding and buffering the batch
                 self.log_diag(f"[ARCHIVE] Embedded {len(imgs_to_embed)} images. Buffer status: {len(self.ingest_buffer)}/{self.batch_buffer_size.value()}")
