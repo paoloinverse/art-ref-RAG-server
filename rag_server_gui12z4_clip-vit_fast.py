@@ -1975,6 +1975,8 @@ class RagAgentWindow(QMainWindow):
                 paths_to_embed_images = []
                 texts_to_embed = []
 
+                self.log_diag(f"[PDF] Processing from page {page_start} / {total_pages}")
+
                 for i in range(page_start, min(page_start + page_batch_size, total_pages)):
                     page = doc[i]
                     text = page.get_text().strip()
@@ -2031,16 +2033,33 @@ class RagAgentWindow(QMainWindow):
                         from PIL import Image
                         with torch.no_grad():
                             self.active_model_obj.eval()
-                            images = [Image.open(p).convert("RGB") for p in imgs_to_embed]
-                            features = self.active_model_obj.encode(images)
-                            if hasattr(features, "detach"):
-                                features = features.detach().cpu().numpy()
-                            features = np.array(features, dtype=np.float32)
-                            norms = np.linalg.norm(features, axis=1, keepdims=True)
-                            norms[norms == 0] = 1
-                            features = features / norms
-                            for idx, p in enumerate(imgs_to_embed):
-                                computed_img_vecs[p] = features[idx].tolist()
+                            images = []
+                            valid_paths = []
+                            for p in imgs_to_embed:
+                                try:
+                                    img = Image.open(p)
+                                    img.load()
+                                    images.append(img.convert("RGB"))
+                                    valid_paths.append(p)
+                                except Exception as img_err:
+                                    self.log_diag(f"[PDF WARNING] Skipping corrupted/unreadable page image {os.path.basename(p)}: {img_err}")
+                                    if 'img' in locals():
+                                        try: img.close()
+                                        except Exception: pass
+                            
+                            if images:
+                                features = self.active_model_obj.encode(images)
+                                if hasattr(features, "detach"):
+                                    features = features.detach().cpu().numpy()
+                                features = np.array(features, dtype=np.float32)
+                                norms = np.linalg.norm(features, axis=1, keepdims=True)
+                                norms[norms == 0] = 1
+                                features = features / norms
+                                for idx, p in enumerate(valid_paths):
+                                    computed_img_vecs[p] = features[idx].tolist()
+                            else:
+                                self.log_diag("[PDF WARNING] No valid images to encode in this batch.")
+
 
                 computed_txt_vecs = {}
                 if txts_to_embed:
@@ -2096,15 +2115,16 @@ class RagAgentWindow(QMainWindow):
 
                 QApplication.processEvents()
             
+        except Exception as e:
+            self.log_diag(f"[PDF ERROR] {e}")
+        finally:
             # Cleanup temp directory
             import shutil
             try:
-                shutil.rmtree(temp_dir)
+                if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
             except Exception:
                 pass
-                
-        except Exception as e:
-            self.log_diag(f"[PDF ERROR] {e}")
 
     def process_archive_file(self, path: str):
         try:
@@ -2255,21 +2275,35 @@ class RagAgentWindow(QMainWindow):
                         with torch.no_grad():
                             self.active_model_obj.eval()
                             images = []
+                            valid_paths = []
                             for p in imgs_to_embed:
-                                img = Image.open(p).convert("RGB")
-                                # Fix ambiguous channel dimension warning for extremely small images (e.g., 1px width/height)
-                                if img.width < 10 or img.height < 10:
-                                    img = img.resize((max(img.width, 10), max(img.height, 10)))
-                                images.append(img)
-                            features = self.active_model_obj.encode(images)
-                            if hasattr(features, "detach"):
-                                features = features.detach().cpu().numpy()
-                            features = np.array(features, dtype=np.float32)
-                            norms = np.linalg.norm(features, axis=1, keepdims=True)
-                            norms[norms == 0] = 1
-                            features = features / norms
-                            for idx, p in enumerate(imgs_to_embed):
-                                computed_img_vecs[p] = features[idx].tolist()
+                                try:
+                                    img = Image.open(p)
+                                    img.load()  # Force pixel decode to catch truncated/corrupted files early
+                                    img = img.convert("RGB")
+                                    # Fix ambiguous channel dimension warning for extremely small images (e.g., 1px width/height)
+                                    if img.width < 10 or img.height < 10:
+                                        img = img.resize((max(img.width, 10), max(img.height, 10)))
+                                    images.append(img)
+                                    valid_paths.append(p)
+                                except Exception as img_err:
+                                    self.log_diag(f"[ARCHIVE WARNING] Skipping corrupted/unreadable image {os.path.basename(p)}: {img_err}")
+                                    if 'img' in locals():
+                                        try: img.close()
+                                        except Exception: pass
+                            
+                            if images:
+                                features = self.active_model_obj.encode(images)
+                                if hasattr(features, "detach"):
+                                    features = features.detach().cpu().numpy()
+                                features = np.array(features, dtype=np.float32)
+                                norms = np.linalg.norm(features, axis=1, keepdims=True)
+                                norms[norms == 0] = 1
+                                features = features / norms
+                                for idx, p in enumerate(valid_paths):
+                                    computed_img_vecs[p] = features[idx].tolist()
+                            else:
+                                self.log_diag("[ARCHIVE WARNING] No valid images to encode in this batch.")
 
                 # Construct rows and clean up images immediately
                 batch_rows = []
@@ -2308,15 +2342,16 @@ class RagAgentWindow(QMainWindow):
 
                 QApplication.processEvents()
             
+        except Exception as e:
+            self.log_diag(f"[ARCHIVE ERROR] {e}")
+        finally:
             # Cleanup temp directory
             import shutil
             try:
-                shutil.rmtree(temp_dir)
+                if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
             except Exception:
                 pass
-                
-        except Exception as e:
-            self.log_diag(f"[ARCHIVE ERROR] {e}")
 
     def toggle_live_monitor(self, checked: bool):
         if checked:
