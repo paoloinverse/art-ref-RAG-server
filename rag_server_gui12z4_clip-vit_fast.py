@@ -2085,9 +2085,7 @@ class RagAgentWindow(QMainWindow):
                 # Construct rows and clean up images immediately
                 batch_rows = []
                 for page_num, text, img_path, key, meta_img in page_buffer_data:
-                    # Clean up extracted page image immediately to prevent RAM disk saturation
-                    if os.path.exists(img_path):
-                        os.remove(img_path)
+
                         
                     # Skip pages that already exist in the database
                     if key in key_to_img_vec:
@@ -2113,7 +2111,9 @@ class RagAgentWindow(QMainWindow):
                         "fps": 0.0,
                         "content_key": key
                     })
-    
+                    # Clean up extracted page image immediately to prevent RAM disk saturation
+                    if os.path.exists(img_path):
+                        os.remove(img_path)
 
                 # Accumulate rows into global buffer and flush when full
                 self._accumulate_and_flush("content_key", batch_rows)
@@ -2313,9 +2313,7 @@ class RagAgentWindow(QMainWindow):
                 # Construct rows and clean up images immediately
                 batch_rows = []
                 for internal_name, text, img_path, key, meta_img in page_buffer_data:
-                    # Clean up extracted image immediately
-                    if os.path.exists(img_path):
-                        os.remove(img_path)
+
                         
                     # Skip images that already exist in the database
                     if key in key_to_img_vec:
@@ -2341,6 +2339,9 @@ class RagAgentWindow(QMainWindow):
                         "fps": 0.0,
                         "content_key": key
                     })
+                    # Clean up extracted image immediately
+                    if os.path.exists(img_path):
+                        os.remove(img_path)
 
                 # Log buffer status after embedding and buffering the batch
                 self.log_diag(f"[ARCHIVE] Embedded {len(imgs_to_embed)} images. Buffer status: {len(self.ingest_buffer)}/{self.batch_buffer_size.value()}")
@@ -3050,14 +3051,7 @@ class RagAgentWindow(QMainWindow):
                 QApplication.processEvents()
                 self.log_diag(f"[VIDEO] Finished ingesting {os.path.basename(video_path)}.")
 
-            # NEW: Flush remaining records after ALL videos are processed
-            ## Flush remaining records after ALL videos are processed
-            #if row_buffer:
-            #    self.table.add(row_buffer)
-            #    row_buffer.clear()
-            #    gc.collect()
-            #    QApplication.processEvents()
-    
+
             ## --- CRITICAL FIX: Perform compaction and cleanup ONCE at the end ---
             ## Doing this inside the flush loop causes massive memory bloat and fragmentation
             #self.log_diag("[DB] Ingestion finished. Compacting files and cleaning up old versions...")
