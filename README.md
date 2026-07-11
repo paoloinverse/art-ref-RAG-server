@@ -88,6 +88,9 @@ python rag_server_gui12z4_clip-vit_fast.py
 ```
 The GUI will open. By default, it starts with the Dummy model so you can test the ingestion and search pipeline immediately without downloading AI weights.
 
+**Practical tips:**
+The ingestion pipelines are designed to implement preventive deduplication. You can reingest from the same folder into an existing table, but if part of the data matches existing records by hash, such data will be skipped. While this saves a LOT of computation and time, be aware images and frames already on record cannot be "updated", unless they differ by at least one byte (the hash will then be different).
+
 **Companion Frontend:**
 Open a second terminal (with the same virtual environment activated) and run:
 ```bash
