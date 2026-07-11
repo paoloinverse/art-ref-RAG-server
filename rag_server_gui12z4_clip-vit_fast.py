@@ -1450,7 +1450,6 @@ class RagAgentWindow(QMainWindow):
                     "content_key": ih
                 }])
             
-            self._finalize_ingestion()
             self.log_diag(f"[DB] Inserted vectorized image batch via buffered merge_insert.")
             
         except Exception as e:
@@ -1650,7 +1649,6 @@ class RagAgentWindow(QMainWindow):
             self.log_diag(f"[TEXT] Embedded chunk {chunk_idx}/{total_chunks} ({len(chunk_texts)} texts, {max(0, remaining)} remaining)")
             QApplication.processEvents()
 
-        self._finalize_ingestion()
         self.log_diag(f"[TEXT] Buffered ingestion complete for {len(batch_texts)} texts.")
 
 
@@ -1787,8 +1785,6 @@ class RagAgentWindow(QMainWindow):
                 if batch_texts:
                     self._embed_and_buffer_texts(batch_texts, batch_metas)
                     QApplication.processEvents()
-                    
-            self._finalize_ingestion()
                     
         except Exception as e:
             self.log_diag(f"[CSV ERROR] Failed to ingest {path}: {e}")
@@ -1948,7 +1944,6 @@ class RagAgentWindow(QMainWindow):
             active_cfg = self.model_combo.currentData()
             dim = active_cfg.get("dimension")
             m_type = active_cfg.get("type")
-            buffer_limit = self.batch_buffer_size.value()
 
             # Prepare temp directory (prefer RAM disk for speed to prevent physical FS saturation)
             if os.path.exists("/dev/shm"):
@@ -1963,7 +1958,6 @@ class RagAgentWindow(QMainWindow):
             
             # To prevent /dev/shm from filling up, process in batches of pages
             page_batch_size = self.pdf_batch_size.value()
-            row_buffer = []
             
             for page_start in range(0, total_pages, page_batch_size):
                 if self.stop_requested:
@@ -2069,11 +2063,12 @@ class RagAgentWindow(QMainWindow):
                                 computed_txt_vecs[t] = features[idx].tolist()
 
                 # Construct rows and clean up images immediately
+                batch_rows = []
                 for page_num, text, img_path, key, meta_img in page_buffer_data:
                     i_vec = key_to_img_vec.get(key, computed_img_vecs.get(img_path, [0.0] * dim))
                     t_vec = key_to_txt_vec.get(key, computed_txt_vecs.get(text, [0.0] * dim))
 
-                    row_buffer.append({
+                    batch_rows.append({
                         "id": str(uuid.uuid4()),
                         "text_vector": t_vec,
                         "image_vector": i_vec,
@@ -2096,24 +2091,10 @@ class RagAgentWindow(QMainWindow):
                     if os.path.exists(img_path):
                         os.remove(img_path)
 
-                # Trigger atomic append ONLY when threshold is reached
-                if len(row_buffer) >= buffer_limit:
-                    self.table.add(row_buffer)
-                    row_buffer.clear()
-                    gc.collect()
-                    QApplication.processEvents()
+                # Accumulate rows into global buffer and flush when full
+                self._accumulate_and_flush("content_key", batch_rows)
 
                 QApplication.processEvents()
-
-            # Flush remaining records after ALL pages are processed
-            if row_buffer:
-                self.table.add(row_buffer)
-                row_buffer.clear()
-                gc.collect()
-                QApplication.processEvents()
-            
-            # Centralized end-of-ingestion maintenance
-            self._finalize_ingestion()
             
             # Cleanup temp directory
             import shutil
@@ -2142,7 +2123,6 @@ class RagAgentWindow(QMainWindow):
             active_cfg = self.model_combo.currentData()
             dim = active_cfg.get("dimension")
             m_type = active_cfg.get("type")
-            buffer_limit = self.batch_buffer_size.value()
 
             # Prepare temp directory (prefer RAM disk for speed to prevent physical FS saturation)
             if os.path.exists("/dev/shm"):
@@ -2179,7 +2159,6 @@ class RagAgentWindow(QMainWindow):
 
             total_files = len(internal_files)
             page_batch_size = self.archive_batch_size.value()
-            row_buffer = []
             
             for batch_start in range(0, total_files, page_batch_size):
                 if self.stop_requested:
@@ -2293,11 +2272,12 @@ class RagAgentWindow(QMainWindow):
                                 computed_img_vecs[p] = features[idx].tolist()
 
                 # Construct rows and clean up images immediately
+                batch_rows = []
                 for internal_name, text, img_path, key, meta_img in page_buffer_data:
                     i_vec = key_to_img_vec.get(key, computed_img_vecs.get(img_path, [0.0] * dim))
                     t_vec = [0.0] * dim # Archives primarily contain images, no text extraction yet
 
-                    row_buffer.append({
+                    batch_rows.append({
                         "id": str(uuid.uuid4()),
                         "text_vector": t_vec,
                         "image_vector": i_vec,
@@ -2321,25 +2301,12 @@ class RagAgentWindow(QMainWindow):
                         os.remove(img_path)
 
                 # Log buffer status after embedding and buffering the batch
-                self.log_diag(f"[ARCHIVE] Embedded {len(imgs_to_embed)} images. Buffer status: {len(row_buffer)}/{buffer_limit}")
+                self.log_diag(f"[ARCHIVE] Embedded {len(imgs_to_embed)} images. Buffer status: {len(self.ingest_buffer)}/{self.batch_buffer_size.value()}")
 
-                # Trigger atomic append ONLY when threshold is reached
-                if len(row_buffer) >= buffer_limit:
-                    self.table.add(row_buffer)
-                    row_buffer.clear()
-                    gc.collect()
-                    QApplication.processEvents()
+                # Accumulate rows into global buffer and flush when full
+                self._accumulate_and_flush("content_key", batch_rows)
 
                 QApplication.processEvents()
-
-            # Flush remaining records
-            if row_buffer:
-                self.table.add(row_buffer)
-                row_buffer.clear()
-                gc.collect()
-                QApplication.processEvents()
-            
-            self._finalize_ingestion()
             
             # Cleanup temp directory
             import shutil
