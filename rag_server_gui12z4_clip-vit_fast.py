@@ -6,6 +6,7 @@ import hashlib
 import numpy as np
 import pyarrow as pa
 import lancedb
+import lance
 import psutil
 import gc
 
@@ -1236,7 +1237,7 @@ class RagAgentWindow(QMainWindow):
             gc.collect()
             self.log_diag(f"[DB] Appended {flushed_count} rows to table. ")
         except Exception as e:
-            self.log_diag(f"[DB ERROR] Buffer flush failed: {e} ")
+            self.log_diag(f"[DB ERROR] (there might be a lance/lancedb version mismatch, please run: pip install --upgrade lancedb pylance) Buffer flush failed: {e} ")
 
     def _accumulate_and_flush(self, key_column: str, new_rows: list):
         """Appends rows to the global buffer and flushes when the record limit is reached."""
@@ -1274,7 +1275,7 @@ class RagAgentWindow(QMainWindow):
             self.table.cleanup_old_versions(older_than=datetime.timedelta(minutes=0), delete_unverified=True)
             self.log_diag("[DB] Compaction and version cleanup complete.")
         except Exception as e:
-            self.log_diag(f"[DB ERROR] Maintenance failed: {e}")
+            self.log_diag(f"[DB ERROR] (there might be a lance/lancedb version mismatch, please run: pip install --upgrade lancedb pylance) Maintenance failed: {e}")
 
     def _embed_and_buffer_texts(self, texts: list[str], metas: list[str]):
         """Decoupled text embedding & buffering workflow."""
@@ -1409,16 +1410,37 @@ class RagAgentWindow(QMainWindow):
                         chunk_paths = paths_to_embed[i:i+embed_batch_size]
                         with torch.no_grad():
                             self.active_model_obj.eval()
-                            images = [Image.open(p).convert("RGB") for p in chunk_paths]
-                            features = self.active_model_obj.encode(images)
-                            if hasattr(features, "detach"):
-                                features = features.detach().cpu().numpy()
-                            features = np.array(features, dtype=np.float32)
-                            norms = np.linalg.norm(features, axis=1, keepdims=True)
-                            norms[norms == 0] = 1
-                            features = features / norms
-                            for idx, p in enumerate(chunk_paths):
-                                computed_vectors[p] = features[idx].tolist()
+                            images = []
+                            valid_paths = []
+                            for p in chunk_paths:
+                                try:
+                                    img = Image.open(p)
+                                    img.load()  # Force pixel decode to catch truncated/corrupted files early
+                                    images.append(img.convert("RGB"))
+                                    valid_paths.append(p)
+                                except Exception as img_err:
+                                    self.log_diag(f"[IMAGE WARNING] Skipping corrupted/unreadable image {os.path.basename(p)}: {img_err}")
+                                    if 'img' in locals():
+                                        try: img.close()
+                                        except Exception: pass
+                        
+                            if images:
+                                features = self.active_model_obj.encode(images)
+                                if hasattr(features, "detach"):
+                                    features = features.detach().cpu().numpy()
+                                features = np.array(features, dtype=np.float32)
+                                norms = np.linalg.norm(features, axis=1, keepdims=True)
+                                norms[norms == 0] = 1
+                                features = features / norms
+                                for idx, p in enumerate(valid_paths):
+                                    computed_vectors[p] = features[idx].tolist()
+                            else:
+                                self.log_diag("[IMAGE WARNING] No valid images to encode in this batch.")
+                            
+                            # Close images to free memory and file descriptors
+                            for img in images:
+                                try: img.close()
+                                except Exception: pass
                         remaining_imgs = len(paths_to_embed) - (batch_idx * embed_batch_size)
                         self.log_diag(f"[IMAGE] Embedded batch {batch_idx}/{total_embed_batches} ({len(chunk_paths)} images, {max(0, remaining_imgs)} remaining) ")
 
@@ -1957,6 +1979,35 @@ class RagAgentWindow(QMainWindow):
             total_pages = len(doc)
             pdf_hash = self._calc_image_hash(path) # Reuses generic file byte hasher for content_key uniqueness
             
+            # --- SMART PDF SAMPLING SKIP ---
+            if total_pages > 0:
+                num_probe_pages = min(4, total_pages)
+                probe_keys = []
+                for i in range(num_probe_pages):
+                    page_num = total_pages - i
+                    probe_keys.append(f"{pdf_hash}_page_{page_num}")
+                
+                safe_probe_keys = [k.replace("'", "''") for k in probe_keys]
+                probe_placeholders = ", ".join([f"'{k}'" for k in safe_probe_keys])
+                
+                try:
+                    existing_matches = (
+                        self.table.search()
+                        .where(f"content_key IN ({probe_placeholders})")
+                        .select(["content_key"])
+                        .to_arrow()
+                    )
+                    existing_keys = set(existing_matches["content_key"].to_pylist()) if existing_matches is not None and len(existing_matches) > 0 else set()
+                    
+                    if len(existing_keys) == len(probe_keys):
+                        self.log_diag(f"[PDF] Smart Skip: Last {len(probe_keys)} pages found in DB. Skipping {os.path.basename(path)}.")
+                        doc.close()
+                        return
+                except Exception as e:
+                    self.log_diag(f"[PDF] Smart Skip probe failed: {e}")
+            # --------------------------------
+
+
             # To prevent /dev/shm from filling up, process in batches of pages
             page_batch_size = self.pdf_batch_size.value()
             
@@ -2160,66 +2211,128 @@ class RagAgentWindow(QMainWindow):
             
             # List all valid image files inside the archive
             valid_exts = ('.png', '.jpg', '.jpeg', '.tiff', '.webp')
-            internal_files = []
-            
+            all_tasks = []
             lower_path = path.lower()
+            
             if lower_path.endswith('.zip'):
+                import io
                 with zipfile.ZipFile(path, 'r') as zf:
-                    internal_files = [f for f in zf.namelist() if f.lower().endswith(valid_exts)]
+                    # Direct images
+                    for f in zf.namelist():
+                        if f.lower().endswith(valid_exts):
+                            all_tasks.append({"internal_name": f, "type": "direct_zip"})
+                    
+                    # Nested ZIPs
+                    nested_zips = [f for f in zf.namelist() if f.lower().endswith('.zip')]
+                    for nested_zip_name in nested_zips:
+                        self.log_diag(f"[ARCHIVE] Found nested ZIP: {nested_zip_name}. Attempting extraction with encoding fallback...")
+                        try:
+                            inner_zip_bytes = zf.read(nested_zip_name)
+                            inner_zip_buffer = io.BytesIO(inner_zip_bytes)
+                            nested_prefix = os.path.splitext(os.path.basename(nested_zip_name))[0]
+                            
+                            encoding_fallbacks = ['shift_jis', 'cp932', 'gbk', 'gb2312', 'big5', 'euc-jp', 'utf-8']
+                            
+                            def _is_reasonable_filename(filename):
+                                if filename.count('\ufffd') > len(filename) * 0.3:
+                                    return False
+                                if any(ord(c) < 32 and c not in '\r\n\t' for c in filename):
+                                    return False
+                                return True
+
+                            extracted_entries = []
+                            successful_encoding = None
+                            for encoding in encoding_fallbacks:
+                                try:
+                                    inner_zip_buffer.seek(0)
+                                    with zipfile.ZipFile(inner_zip_buffer, "r", metadata_encoding=encoding) as inner_zip:
+                                        sample_names = inner_zip.namelist()[:5]
+                                        if all(_is_reasonable_filename(name) for name in sample_names):
+                                            self.log_diag(f"[ARCHIVE] Nested ZIP encoding detected: {encoding}")
+                                            for inner_entry in inner_zip.namelist():
+                                                if inner_entry.lower().endswith(valid_exts) and not inner_entry.startswith("__MACOSX"):
+                                                    extracted_entries.append(inner_entry)
+                                            successful_encoding = encoding
+                                            break
+                                except Exception:
+                                    continue
+                            
+                            if extracted_entries:
+                                self.log_diag(f"[ARCHIVE] Found {len(extracted_entries)} images in nested ZIP {nested_zip_name}")
+                                for inner_entry in extracted_entries:
+                                    all_tasks.append({
+                                        "internal_name": inner_entry, 
+                                        "type": "nested_zip", 
+                                        "nested_zip_name": nested_zip_name,
+                                        "nested_prefix": nested_prefix,
+                                        "inner_zip_bytes": inner_zip_bytes,
+                                        "encoding": successful_encoding
+                                    })
+                            else:
+                                self.log_diag(f"[ARCHIVE WARNING] Could not extract images from nested ZIP {nested_zip_name} with any encoding.")
+                        except Exception as e:
+                            self.log_diag(f"[ARCHIVE ERROR] Failed to process nested ZIP {nested_zip_name}: {e}")
+                            
             elif lower_path.endswith(('.tar.gz', '.tgz')):
                 with tarfile.open(path, 'r:gz') as tf:
-                    internal_files = [m.name for m in tf.getmembers() if m.isfile() and m.name.lower().endswith(valid_exts)]
+                    for m in tf.getmembers():
+                        if m.isfile() and m.name.lower().endswith(valid_exts):
+                            all_tasks.append({"internal_name": m.name, "type": "direct_tar"})
             elif lower_path.endswith('.7z'):
                 if not py7zr:
                     self.log_diag("[ARCHIVE ERROR] py7zr not installed. Cannot process 7z files. (pip install py7zr)")
                     return
                 with py7zr.SevenZipFile(path, mode='r') as szf:
-                    internal_files = [f for f in szf.getnames() if f.lower().endswith(valid_exts)]
+                    for f in szf.getnames():
+                        if f.lower().endswith(valid_exts):
+                            all_tasks.append({"internal_name": f, "type": "direct_7z"})
             else:
                 return
-
-            if not internal_files:
+                
+            if not all_tasks:
                 self.log_diag(f"[ARCHIVE] No valid images found inside {os.path.basename(path)}.")
                 return
-
-            total_files = len(internal_files)
+                
+            total_files = len(all_tasks)
             page_batch_size = self.archive_batch_size.value()
-            
             for batch_start in range(0, total_files, page_batch_size):
                 if self.stop_requested:
                     break
-
                 # Clean temp directory before extracting new batch
                 for f in os.listdir(temp_dir):
                     try:
                         os.remove(os.path.join(temp_dir, f))
                     except Exception:
                         pass
-
                 page_buffer_data = [] # (internal_name, text, img_path, content_key, meta_img)
                 paths_to_embed_images = []
-
-                batch_files = internal_files[batch_start:batch_start + page_batch_size]
+                batch_tasks = all_tasks[batch_start:batch_start + page_batch_size]
                 
                 # Extract batch
-                for internal_name in batch_files:
+                for task in batch_tasks:
+                    internal_name = task["internal_name"]
                     # Sanitize internal name for local filesystem
                     safe_internal_name = os.path.basename(internal_name)
                     img_path = os.path.join(temp_dir, f"img_{uuid.uuid4().hex}_{safe_internal_name}")
-                    
                     try:
-                        if lower_path.endswith('.zip'):
+                        if task["type"] == "direct_zip":
                             with zipfile.ZipFile(path, 'r') as zf:
                                 with zf.open(internal_name) as src, open(img_path, 'wb') as dst:
                                     dst.write(src.read())
-                        elif lower_path.endswith(('.tar.gz', '.tgz')):
+                        elif task["type"] == "nested_zip":
+                            import io
+                            inner_buffer = io.BytesIO(task["inner_zip_bytes"])
+                            with zipfile.ZipFile(inner_buffer, "r", metadata_encoding=task["encoding"]) as inner_zip:
+                                with inner_zip.open(internal_name) as src, open(img_path, 'wb') as dst:
+                                    dst.write(src.read())
+                        elif task["type"] == "direct_tar":
                             with tarfile.open(path, 'r:gz') as tf:
                                 member = tf.getmember(internal_name)
                                 fobj = tf.extractfile(member)
                                 if fobj:
                                     with open(img_path, 'wb') as dst:
                                         dst.write(fobj.read())
-                        elif lower_path.endswith('.7z'):
+                        elif task["type"] == "direct_7z":
                             with py7zr.SevenZipFile(path, mode='r') as szf:
                                 szf.extract(targets=[internal_name], path=temp_dir)
                                 # Rename the extracted file to our safe img_path
@@ -2229,13 +2342,16 @@ class RagAgentWindow(QMainWindow):
                     except Exception as extract_err:
                         self.log_diag(f"[ARCHIVE ERROR] Failed to extract {internal_name}: {extract_err}")
                         continue
-
                     if not os.path.exists(img_path):
                         continue
-
+                    
                     content_key = f"{archive_hash}::{internal_name}"
                     meta_img = json.dumps({"source": os.path.basename(path), "internal_name": internal_name, "format": "archive_slice"})
                     
+                    if task["type"] == "nested_zip":
+                        content_key = f"{archive_hash}::{task['nested_zip_name']}::{internal_name}"
+                        meta_img = json.dumps({"source": os.path.basename(path), "internal_name": internal_name, "nested_zip": task["nested_zip_name"], "format": "archive_slice"})
+                        
                     page_buffer_data.append((internal_name, "", img_path, content_key, meta_img))
                     paths_to_embed_images.append(img_path)
 
@@ -2392,7 +2508,6 @@ class RagAgentWindow(QMainWindow):
     def _get_base64_image(self, image_path: str, metadata: dict) -> str:
         import base64
         import io
-        
         # Scenario A: Image exists safely on disk
         if image_path and os.path.exists(image_path):
             try:
@@ -2401,68 +2516,183 @@ class RagAgentWindow(QMainWindow):
             except Exception as e:
                 self.log_diag(f"[B64 ERROR] Read failure: {e}")
                 return ""
-
-        # Scenario C: Image is inside a compressed archive
+        # Scenario C: Image is inside a compressed archive (including nested archives)
         if metadata and metadata.get("format") == "archive_slice":
             internal_name = metadata.get("internal_name")
+            nested_zip_name = metadata.get("nested_zip")
+            # Use RAM disk for extraction
+            if os.path.exists("/dev/shm"):
+                temp_arch_img = os.path.join("/dev/shm", f"arch_img_{uuid.uuid4().hex}.png")
+            else:
+                temp_arch_img = tempfile.mktemp(suffix=".png")
+            
+            # Parse the image_path to get original archive path
+            # Format: "archive_path::internal_name" or "archive_path::nested.zip::internal_name"
+            original_archive_path = None
             if image_path and "::" in image_path:
                 parts = image_path.split("::", 1)
                 original_archive_path = parts[0]
-                if os.path.exists(original_archive_path) and internal_name:
-                    try:
-                        import zipfile
-                        import tarfile
-                        try:
-                            import py7zr
-                        except ImportError:
-                            py7zr = None
-                        
-                        # Use RAM disk for extraction
-                        if os.path.exists("/dev/shm"):
-                            temp_arch_img = os.path.join("/dev/shm", f"arch_img_{uuid.uuid4().hex}.png")
-                        else:
-                            temp_arch_img = tempfile.mktemp(suffix=".png")
-                            
-                        lower_path = original_archive_path.lower()
-                        extracted = False
-                        
-                        if lower_path.endswith('.zip'):
-                            with zipfile.ZipFile(original_archive_path, 'r') as zf:
-                                with zf.open(internal_name) as src, open(temp_arch_img, 'wb') as dst:
-                                    dst.write(src.read())
-                            extracted = True
-                        elif lower_path.endswith(('.tar.gz', '.tgz')):
-                            with tarfile.open(original_archive_path, 'r:gz') as tf:
-                                member = tf.getmember(internal_name)
-                                fobj = tf.extractfile(member)
-                                if fobj:
-                                    with open(temp_arch_img, 'wb') as dst:
-                                        dst.write(fobj.read())
-                                    extracted = True
-                        elif lower_path.endswith('.7z'):
-                            if py7zr:
-                                with py7zr.SevenZipFile(original_archive_path, mode='r') as szf:
-                                    szf.extract(targets=[internal_name], path=os.path.dirname(temp_arch_img))
-                                    # py7zr preserves internal folder structures, so we check where it went
-                                    extracted_path = os.path.join(os.path.dirname(temp_arch_img), internal_name)
-                                    if os.path.exists(extracted_path):
-                                        os.rename(extracted_path, temp_arch_img)
-                                        extracted = True
+            
+            if not original_archive_path or not os.path.exists(original_archive_path):
+                self.log_diag(f"[B64 ERROR] Cannot find archive: {original_archive_path}")
+                return ""
+            
+            if not internal_name:
+                self.log_diag(f"[B64 ERROR] No internal name specified for {image_path}")
+                return ""
+            
+            try:
+                import zipfile
+                import tarfile
+                try:
+                    import py7zr
+                except ImportError:
+                    py7zr = None
+                
+                lower_path = original_archive_path.lower()
+                extracted = False
+             
+                # Helper function for flexible filename matching
+                def _find_matching_entry(namelist, target_name):
+                    """Find entry with flexible matching (basename, full path, or substring)"""
+                    target_lower = target_name.lower()
+                    target_base = os.path.basename(target_name).lower()
+                 
+                    # Exact match
+                    if target_name in namelist:
+                        return target_name
+                 
+                    # Case-insensitive exact match
+                    for name in namelist:
+                        if name.lower() == target_lower:
+                            return name
+                 
+                    # Match by basename (handles subfolder scenarios)
+                    for name in namelist:
+                        if os.path.basename(name).lower() == target_base:
+                            return name
+                 
+                    # Substring match (for paths with subfolders)
+                    for name in namelist:
+                        if target_lower in name.lower() or name.lower() in target_lower:
+                            return name
+                 
+                    return None
+             
+                # Handle nested ZIP archives
+                if nested_zip_name:
+                    self.log_diag(f"[B64] Extracting from nested archive: {nested_zip_name} -> {internal_name}")
+                    if lower_path.endswith('.zip'):
+                        # Extract outer archive to get nested ZIP bytes
+                        with zipfile.ZipFile(original_archive_path, 'r') as outer_zip:
+                            # Try to find nested ZIP with flexible matching
+                            nested_zip_entry = None
+                            for name in outer_zip.namelist():
+                                if name.lower() == nested_zip_name.lower() or os.path.basename(name).lower() == os.path.basename(nested_zip_name).lower():
+                                    nested_zip_entry = name
+                                    break
+                         
+                            if nested_zip_entry:
+                                inner_zip_bytes = outer_zip.read(nested_zip_entry)
+                                inner_zip_buffer = io.BytesIO(inner_zip_bytes)
+                             
+                                # Try multiple encodings for the nested archive
+                                encoding_fallbacks = ['shift_jis', 'cp932', 'gbk', 'gb2312', 'big5', 'euc-jp', 'utf-8']
+                             
+                                for encoding in encoding_fallbacks:
+                                    try:
+                                        inner_zip_buffer.seek(0)
+                                        with zipfile.ZipFile(inner_zip_buffer, "r", metadata_encoding=encoding) as inner_zip:
+                                            namelist = inner_zip.namelist()
+                                            
+                                            # Find the target file with flexible matching
+                                            target_entry = _find_matching_entry(namelist, internal_name)
+                                         
+                                            if target_entry:
+                                                self.log_diag(f"[B64] Nested ZIP encoding detected: {encoding}, entry: {target_entry}")
+                                                with inner_zip.open(target_entry) as src, open(temp_arch_img, 'wb') as dst:
+                                                    dst.write(src.read())
+                                                extracted = True
+                                                break
+                                            else:
+                                                self.log_diag(f"[B64] Entry '{internal_name}' not found in nested ZIP with encoding {encoding}. Available: {len(namelist)} files")
+                                    except Exception as enc_err:
+                                        inner_zip_buffer.seek(0)
+                                        continue
+                             
+                                if not extracted:
+                                    self.log_diag(f"[B64 ERROR] Could not extract '{internal_name}' from nested ZIP {nested_zip_name} with any encoding")
                             else:
-                                self.log_diag("[B64 ERROR] py7zr missing. Cannot recover 7z archive image.")
+                                self.log_diag(f"[B64 ERROR] Nested ZIP {nested_zip_name} not found in outer archive")
+                
+                # Handle direct extraction from outer archive
+                elif lower_path.endswith('.zip'):
+                    with zipfile.ZipFile(original_archive_path, 'r') as zf:
+                        namelist = zf.namelist()
                         
-                        if extracted and os.path.exists(temp_arch_img):
-                            with open(temp_arch_img, "rb") as f:
-                                b64_data = base64.b64encode(f.read()).decode('utf-8')
-                            os.remove(temp_arch_img)
-                            self.log_diag(f"[B64 RECOVERY] Live extracted missing archive image {internal_name} to RAM disk")
-                            return b64_data
-                            
-                    except Exception as e:
-                        self.log_diag(f"[B64 ERROR] Archive live extract failed: {e}")
-                        if 'temp_arch_img' in locals() and os.path.exists(temp_arch_img):
-                            os.remove(temp_arch_img)
-
+                        # Find entry with flexible matching
+                        target_entry = _find_matching_entry(namelist, internal_name)
+                     
+                        if target_entry:
+                            self.log_diag(f"[B64] Found entry: {target_entry} (requested: {internal_name})")
+                            with zf.open(target_entry) as src, open(temp_arch_img, 'wb') as dst:
+                                dst.write(src.read())
+                            extracted = True
+                        else:
+                            self.log_diag(f"[B64 ERROR] Entry '{internal_name}' not found in archive. Available: {len(namelist)} files")
+                            if namelist:
+                                self.log_diag(f"[B64] Sample entries: {namelist[:5]}")
+             
+                elif lower_path.endswith(('.tar.gz', '.tgz')):
+                    with tarfile.open(original_archive_path, 'r:gz') as tf:
+                        members = tf.getnames()
+                     
+                        # Find member with flexible matching
+                        target_member = _find_matching_entry(members, internal_name)
+                     
+                        if target_member:
+                            member_obj = tf.getmember(target_member)
+                            fobj = tf.extractfile(member_obj)
+                            if fobj:
+                                with open(temp_arch_img, 'wb') as dst:
+                                    dst.write(fobj.read())
+                                extracted = True
+                        else:
+                            self.log_diag(f"[B64 ERROR] Entry '{internal_name}' not found in tar archive")
+             
+                elif lower_path.endswith('.7z'):
+                    if py7zr:
+                        with py7zr.SevenZipFile(original_archive_path, mode='r') as szf:
+                            names = szf.getnames()
+                         
+                            # Find entry with flexible matching
+                            target_entry = _find_matching_entry(names, internal_name)
+                         
+                            if target_entry:
+                                szf.extract(targets=[target_entry], path=os.path.dirname(temp_arch_img))
+                                extracted_path = os.path.join(os.path.dirname(temp_arch_img), target_entry)
+                                if os.path.exists(extracted_path):
+                                    os.rename(extracted_path, temp_arch_img)
+                                    extracted = True
+                            else:
+                                self.log_diag(f"[B64 ERROR] Entry '{internal_name}' not found in 7z archive")
+                    else:
+                        self.log_diag("[B64 ERROR] py7zr missing. Cannot recover 7z archive image.")
+             
+                if extracted and os.path.exists(temp_arch_img):
+                    with open(temp_arch_img, "rb") as f:
+                        b64_data = base64.b64encode(f.read()).decode('utf-8')
+                    os.remove(temp_arch_img)
+                    self.log_diag(f"[B64 RECOVERY] Live extracted missing archive image {internal_name} to RAM disk")
+                    return b64_data
+         
+            except Exception as e:
+                self.log_diag(f"[B64 ERROR] Archive live extract failed: {e}")
+                import traceback
+                self.log_diag(f"[B64 ERROR] Traceback: {traceback.format_exc()}")
+                if 'temp_arch_img' in locals() and os.path.exists(temp_arch_img):
+                    os.remove(temp_arch_img)
+     
         # Scenario B: Image is missing, but it was a PDF slice. Re-extract to /dev/shm on demand.
         if metadata and metadata.get("format") == "visual_slice":
             page_num = metadata.get("page")
@@ -2476,18 +2706,15 @@ class RagAgentWindow(QMainWindow):
                         if 0 <= page_idx < len(doc):
                             page = doc[page_idx]
                             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                            
                             # Re-extract to /dev/shm on demand during searches
                             if os.path.exists("/dev/shm"):
                                 temp_pdf_img = os.path.join("/dev/shm", f"pdf_page_{uuid.uuid4().hex}.png")
                             else:
                                 temp_pdf_img = tempfile.mktemp(suffix=".png")
-                                
                             pix.save(temp_pdf_img)
                             with open(temp_pdf_img, "rb") as f:
                                 b64_data = base64.b64encode(f.read()).decode('utf-8')
                             os.remove(temp_pdf_img)
-                            
                             self.log_diag(f"[B64 RECOVERY] Live rendered missing page {page_num} to RAM disk from {os.path.basename(original_pdf_path)}")
                             return b64_data
                     except ImportError:
