@@ -104,15 +104,15 @@ def _extract_video_frame(metadata, cache_dir):
     if os.path.exists(out_path):
         return out_path
         
-    print(f"calling ffmpeg to extract a frame from {video_path}")
+    print(f"[FFmpeg] Starting extraction for video: {video_path} | Frame: {frame_num} | Timestamp: {timestamp:.2f}s")
     cmd = [
         "ffmpeg", "-y", "-ss", str(timestamp), "-i", video_path,
         "-frames:v", "1", "-q:v", "2", out_path
     ]
-    
     try:
-        # Gracefully handle stdio to prevent blocking the UI thread
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=60)
+        # Use DEVNULL for stdio to prevent the subprocess from receiving SIGTTOU/SIGTTIN 
+        # and getting stopped when the main GUI process is pushed to the background.
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=60)
         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             return out_path
     except subprocess.TimeoutExpired:
@@ -285,7 +285,7 @@ class ZmqSearchThread(QThread):
     finished_signal = Signal(dict, str)
     error_signal = Signal(str, str)
 
-    def __init__(self, text_query, image_path, image_b64, limit, search_type, target_address, request_id="local_gui", timeout_ms=60000):
+    def __init__(self, text_query, image_path, image_b64, limit, search_type, target_address, request_id="local_gui", timeout_ms=300000):
         super().__init__()
         self.text_query = text_query
         self.image_path = image_path
@@ -390,47 +390,38 @@ class DiagnosticWindow(QWidget):
         self.resize(1100, 800)
         self.json_data = json_data
         self.active_query_text = active_query_text
+
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
-        
+
         # TAB 1: Visual Display
         tab_visual = QWidget()
         v_layout = QHBoxLayout(tab_visual)
-        
         main_splitter = QSplitter(Qt.Horizontal)
         self.list = QListWidget()
-        
         # Right side: Vertical split for Image (top) and Payload (bottom)
         right_splitter = QSplitter(Qt.Vertical)
         self.viewer = ZoomableGraphicsView()
-        
         self.payload_viewer = QTextEdit()
         self.payload_viewer.setReadOnly(True)
         # Set a monospaced font for better JSON/Text readability
         self.payload_viewer.setStyleSheet("font-family: monospace;")
-        
         right_splitter.addWidget(self.viewer)
         right_splitter.addWidget(self.payload_viewer)
-        
         main_splitter.addWidget(self.list)
         main_splitter.addWidget(right_splitter)
-        
         # Fix #1: Apply sensible default widths/heights so nothing is minimized
         main_splitter.setSizes([300, 800]) 
         right_splitter.setSizes([500, 300])
-        
         v_layout.addWidget(main_splitter)
-        
         # TAB 2: File/Text Viewer
         self.file_viewer = QTextEdit()
         self.file_viewer.setReadOnly(True)
         self.tabs.addTab(tab_visual, "Visual Display")
         self.tabs.addTab(self.file_viewer, "File Viewer")
-        
         # TAB 3: Export Gallery
         self.setup_export_gallery()
-        
         # TAB 4: Raw JSON
         raw = QTextEdit()
         raw.setPlainText(json.dumps(json_data, indent=4, ensure_ascii=False))
@@ -440,11 +431,32 @@ class DiagnosticWindow(QWidget):
         self._cache_dir = _get_frame_cache_dir()
         os.makedirs(self._cache_dir, exist_ok=True)
 
+        # Check for archive_slice or visual_slice formats without base64 data
+        has_server_side_extractions = False
+        for res in json_data.get("results", []):
+            meta = res.get("metadata", {})
+            fmt = meta.get("format", "")
+            b64 = res.get("image_base64", "")
+            if fmt in ("archive_slice", "visual_slice") and not b64:
+                has_server_side_extractions = True
+                break
+
+        if has_server_side_extractions:
+            QMessageBox.warning(
+                self,
+                "Server-Side Extraction Required",
+                "Some results require complex extraction logic (archive_slice or visual_slice formats).\n\n"
+                "These results do not contain base64 image data. To view these images properly, please:\n\n"
+                "1. Go to your RAG server configuration\n"
+                "2. Enable 'Return Local Images as Base64 in Searches'\n"
+                "3. Re-run your search\n\n"
+                "Without this setting, images embedded in archives or PDFs cannot be displayed."
+            )
+
         # Populate Lists
         for i, res in enumerate(json_data.get("results", [])):
             self.list.addItem(f"[{i+1}] Dist: {res.get('distance', 0):.3f}")
             meta = res.get("metadata", {})
-            
             data = {
                 "b64": res.get("image_base64", ""),
                 "path": res.get("image_path", ""),
@@ -452,11 +464,9 @@ class DiagnosticWindow(QWidget):
                 "metadata": meta,
                 "extracted_path": ""
             }
-            
             # Extract frame if it's a video result without an existing path
             if meta.get("type") == "video_frame" and not data["path"]:
                 data["extracted_path"] = _extract_video_frame(meta, self._cache_dir)
-                
             self.list.item(i).setData(Qt.UserRole, data)
 
             
@@ -1271,16 +1281,14 @@ class RagFrontEnd(QMainWindow):
         self.last_results = data
         self.btn_diag.setEnabled(True)
         count = len(data.get('results', []))
-        msg = f"Found {count} results."
-        
+        msg = f"Found {count} results (timeout preset: 300s)."
         # Check if any result is a video frame that still needs extraction
         needs_extraction = any(
             r.get("metadata", {}).get("type") == "video_frame" and not r.get("image_path")
             for r in data.get("results", [])
         )
         if needs_extraction:
-            msg += " extracting the video frames might require some time, please check the terminal for live information"
-            
+            msg += " Extracting video frames might require additional time, please check the terminal for live information."
         self.status.setText(msg)
 
 
